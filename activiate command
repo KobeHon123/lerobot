@@ -1,0 +1,211 @@
+----------------------------------------connection------------------------------------------------
+
+cd ~/lerobot
+conda activate lerobot #python3.10.19 torch: 2.7.1+cu126 lerobot 0.4.3
+conda activate lerobot312 #python3.12.13 torch: 2.11.0+cu126 lerobot 0.6.0
+lerobot-find-port
+
+ls /dev/video*
+ffplay -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 30 -fflags nobuffer -flags low_delay -i /dev/video1
+
+lerobot-calibrate --robot.type=so100_follower --robot.port=/dev/ttyACM2 --robot.id=my_awesome_follower_arm
+lerobot-calibrate --teleop.type=so100_leader --teleop.port=/dev/ttyACM1 --teleop.id=my_awesome_leader_arm
+
+lerobot-find-cameras opencv
+ffplay /dev/video0
+#No lantency
+ffplay -f v4l2 -input_format yuyv422 -video_size 640x480 -framerate 30 \
+  -fflags nobuffer -flags low_delay -framedrop -sync ext -an \
+  -i /dev/video0
+
+lerobot-teleoperate --robot.type=so100_follower --robot.port=/dev/ttyACM1 --robot.id=my_awesome_follower_arm --teleop.type=so100_leader --teleop.port=/dev/ttyACM0 --teleop.id=my_awesome_leader_arm --robot.camera_timeout_ms=1000 --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": "/dev/video2", "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}}' --display_data=true
+
+huggingface-cli login
+
+HF_USER=$(hf auth whoami | head -n 1)
+echo $HF_USER
+
+//check wowskin
+cd ~/Haptic_Sensor/WowSkin
+python wowskin_combined.py -p /dev/ttyACM2
+
+//remove cache
+rm -rf ~/.cache/huggingface
+--------------------------------------record and training---------------------------------------
+
+//record dataset(rusume)
+lerobot-record --robot.type=so100_follower --robot.port=/dev/ttyACM1 --robot.id=my_awesome_follower_arm --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}}' --teleop.type=so100_leader --teleop.port=/dev/ttyACM0 --teleop.id=my_awesome_leader_arm --display_data=true --dataset.repo_id=KHandsome/test1 --dataset.num_episodes=2 --dataset.single_task="Grab the bagel rubber and place at white area" --dataset.episode_time_s=30 --dataset.reset_time_s=5 
+(--resume=true)
+
+//Replay dataset
+lerobot-replay --robot.type=so100_follower --robot.port=/dev/ttyACM0 --robot.id=my_awesome_follower_arm --dataset.repo_id=KHandsome/train100-combined --dataset.episode=0 
+
+//Train ACT
+lerobot-train --dataset.repo_id=KHandsome/wow-1 --policy.type=act --output_dir=outputs/train/wow-act-with-haptic - --job_name=wow-act-with-haptic  --batch_size=4 --policy.device=cuda --wandb.enable=true --policy.push_to_hub=true --steps=30000 --policy.repo_id=KHandsome/wow-act-with-haptic 
+
+huggingface-cli upload ${HF_USER}/train-data1 \
+  outputs/train/act_so101_test/checkpoints/last/pretrained_model
+
+//Evaluate ACT
+lerobot-record --robot.type=so100_follower --robot.port=/dev/ttyACM0 --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}}' --robot.id=my_awesome_follower_arm --display_data=true --dataset.repo_id=KHandsome/eval_so100_test4 --dataset.single_task="Grab the white rubber and place at red circle" --teleop.type=so100_leader --teleop.port=/dev/ttyACM1 --teleop.id=my_awesome_leader_arm --policy.path=KHandsome/act-policy1 --dataset.reset_time_s=8 
+
+//lerobot-train --policy.path=lerobot/smolvla_base --dataset.repo_id=KHandsome/act-train50-1 --batch_size=2 --steps=20000 --output_dir=outputs/train/my_smolvla --job_name=my_smolvla_training --policy.device=cuda --wandb.enable=true --policy.repo_id=KHandsome/smolvla1//
+
+//Train pi0
+python src/lerobot/scripts/lerobot_train.py --dataset.repo_id=KHandsome/train100-combined --dataset.video_backend=pyav --policy.type=pi0 --output_dir=./outputs/pi0_training1 --job_name=pi0_training2 --policy.pretrained_path=lerobot/pi0_base --policy.repo_id=KHandsome/pi0-100ep-50000step --policy.compile_model=false --policy.gradient_checkpointing=true --wandb.enable=true --policy.dtype=bfloat16 --policy.freeze_vision_encoder=true --policy.train_expert_only=true --steps=50000 --policy.device=cuda --batch_size=8
+
+//Evaluate pi0
+lerobot-record --robot.type=so100_follower --robot.port=/dev/ttyACM0 --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}}' --robot.id=my_awesome_follower_arm --display_data=false --dataset.repo_id=KHandsome/eval_pi0-10 --dataset.single_task="Grab the white rubber and place at red circle" --policy.path=KHandsome/pi0-100ep-50000step --teleop.type=so100_leader --teleop.port=/dev/ttyACM1 --teleop.id=my_awesome_leader_arm --dataset.reset_time_s=8 
+
+----------------------------------------run pod training-----------------------------------------
+huggingface-cli login                 or                       hf auth login
+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
+
+wandb login
+
+
+#runpod
+# 1. Enter the big drive
+cd /workspace
+
+# 2. Create and activate the permanent environment
+python3 -m venv venv_lerobot
+source venv_lerobot/bin/activate
+
+# 3. Upgrade core tools
+pip install --upgrade pip setuptools wheel
+
+# 4. Clone and install LeRobot with Pi0 extras
+git clone https://github.com/huggingface/lerobot.git
+cd lerobot
+pip install -e ".[pi]"
+
+# 5. Fix version mismatches for Pi0
+pip install "transformers==4.45.2" "accelerate>=0.33.0"
+
+# 6. Setup for Python (no need, it is pre-installed)
+pip install ipykernel
+python -m ipykernel install --user --name=venv_lerobot --display-name "LeRobot-Pi0"
+
+export HF_HOME="/workspace/hf_cache"
+export HF_LEROBOT_HOME="/workspace/outputs"
+
+# Create the folder on the big drive
+mkdir -p /workspace/hf_cache
+# Add to your profile so it's always active
+echo 'export HF_HOME="/workspace/hf_cache"' >> ~/.bashrc
+source ~/.bashrc
+
+#check storage
+df -h
+-----------------------------------wowskin integration---------------------------
+--robot.type=so100_wowskin --robot.wowskin_port=/dev/ttyACM1
+
+#Tele Check
+lerobot-teleoperate --robot.type=so100_wowskin --robot.wowskin_port=/dev/ttyACM0 --robot.port=/dev/ttyACM2 --robot.id=my_awesome_follower_arm --teleop.type=so100_leader --teleop.port=/dev/ttyACM1 --teleop.id=my_awesome_leader_arm --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": "/dev/video2", "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}}' --display_data=true --display_mode=foxglove
+
+#Record
+lerobot-record --robot.type=so100_wowskin --robot.wowskin_port=/dev/ttyACM0 --robot.port=/dev/ttyACM2 --robot.id=my_awesome_follower_arm --teleop.type=so100_leader --teleop.port=/dev/ttyACM0 --teleop.id=my_awesome_leader_arm --robot.camera_timeout_ms=1000 --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": "/dev/video2", "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}}' --display_data=true --display_mode=foxglove --dataset.repo_id=KHandsome/Task-one-2nd-twobag --dataset.num_episodes=20 --dataset.single_task="Pick and place each bun into the red tray, then pick and place each baguette piece into the white tray" --dataset.episode_time_s=80 --dataset.reset_time_s=10 --resume=true
+
+#combine dataset
+lerobot-edit-dataset --repo_id KHandsome/Task-one-combine-2nd --operation.type merge --operation.repo_ids "['KHandsome/Task-one-2nd-onebun', 'KHandsome/Task-one-2nd-twobun', 'KHandsome/Task-one-2nd-onebunonebag', 'KHandsome/Task-one-2nd-onebag', 'KHandsome/Task-one-2nd-twobag']" --push_to_hub true
+
+#upload from cache
+python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; LeRobotDataset('KHandsome/Task-one-combine').push_to_hub()"
+
+#With WowSkin
+lerobot-train \
+  --dataset.repo_id=KHandsome/wow-1 \
+  --policy.type=act \
+  --output_dir=outputs/train/act-wow-1-with-wowskin \
+  --job_name=act-wow-1-with-wowskin \
+  --batch_size=4 \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --policy.push_to_hub=true \
+  --steps=30000 \
+  --policy.repo_id=KHandsome/wow-act-with-haptic
+  
+#Without WowSkin
+lerobot-train \
+  --dataset.repo_id=KHandsome/Task-one-combine\
+  --policy.type=act \
+  --policy.input_features='{"observation.state":{"type":"STATE","shape":[6]},"observation.images.base":{"type":"VISUAL","shape":[3,480,640]},"observation.images.wrist":{"type":"VISUAL","shape":[3,480,640]}}' \
+  --output_dir=outputs/train/taskone-raw-act \
+  --job_name=taskone-raw-act \
+  --batch_size=8 \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --policy.push_to_hub=true \
+  --steps=30000 \
+  --policy.repo_id=KHandsome/taskone-raw-act
+
+#evaluate haptic
+lerobot-record --robot.type=so100_wowskin --robot.wowskin_port=/dev/ttyACM4 --robot.port=/dev/ttyACM3 --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30}}' --robot.id=my_awesome_follower_arm --display_data=true --dataset.repo_id=KHandsome/eval_wow_with --dataset.single_task="pick the bagel and place it on white cardboard" --teleop.type=so100_leader --teleop.port=/dev/ttyACM1 --teleop.id=my_awesome_leader_arm --policy.path=KHandsome/wow-act-with-haptic --dataset.reset_time_s=8 --resume=true
+
+#evaluate RAW ACT no haptic
+lerobot-record --robot.type=so100_wowskin --robot.wowskin_port=/dev/ttyACM0 --robot.port=/dev/ttyACM1 --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}}' --robot.id=my_awesome_follower_arm --display_data=true --dataset.repo_id=KHandsome/eval_taskone-raw-act-2nd --dataset.single_task="pick the bagel and place it on white cardboard" --teleop.type=so100_leader --teleop.port=/dev/ttyACM2 --teleop.id=my_awesome_leader_arm --policy.path=KHandsome/taskone-raw-act-2nd --dataset.reset_time_s=8 --robot.camera_timeout_ms=3000 --dataset.episode_time_s=120 --dataset.num_episodes=10 --resume=true
+
+#evaluate RAW pi0.5 no haptic
+lerobot-record --robot.type=so100_wowskin --robot.wowskin_port=/dev/ttyACM0 --robot.port=/dev/ttyACM2 --robot.cameras='{"base": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}, "wrist": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}}' --robot.id=my_awesome_foll  ower_arm --display_data=true --dataset.repo_id=KHandsome/eval_Taskone-raw-pi05 --dataset.single_task="Pick and place each bun into the red tray, then pick and place each baguette piece into the white tray" --teleop.type=so100_leader --teleop.port=/dev/ttyACM1 --teleop.id=my_awesome_leader_arm --policy.path=KHandsome/taskone-raw-act --dataset.reset_time_s=8 --robot.camera_timeout_ms=3000 --dataset.episode_time_s=120 --resume=true
+
+#evaluate RAW groot no haptic
+python -c '
+import sys, torch, numpy as np, tree, PIL.Image
+from transformers.image_processing_utils import BaseImageProcessor
+from transformers.image_processing_utils_fast import BaseImageProcessorFast
+
+# 1. 治本：抹平顯存毛刺
+torch.set_default_dtype(torch.bfloat16)
+
+# 2. 視覺義肢：自動轉碼器
+def _smart_prepare(self, images, *args, **kwargs):
+    if not isinstance(images, (list, tuple)):
+        images = [images]
+    out = []
+    for x in images:
+        if hasattr(x, "size"):
+            arr = np.array(x)
+            t = torch.from_numpy(arr).permute(2, 0, 1)
+            out.append(t)
+        elif isinstance(x, np.ndarray):
+            t = torch.from_numpy(x)
+            if t.ndim == 3 and t.shape[0] not in [1, 3]:
+                t = t.permute(2, 0, 1)
+            out.append(t)
+        else:
+            out.append(x)
+    return out
+
+BaseImageProcessor._prepare_image_like_inputs = _smart_prepare
+BaseImageProcessorFast._prepare_image_like_inputs = _smart_prepare
+
+# 點火！
+from lerobot.scripts.lerobot_record import main
+sys.exit(main())
+' \
+  lerobot-record --robot.type=so100_wowskin \
+  --robot.wowskin_port=/dev/ttyACM2 \
+  --robot.port=/dev/ttyACM1 \
+  --robot.cameras="{\"base\": {\"type\": \"opencv\", \"index_or_path\": 0, \"width\": 640, \"height\": 480, \"fps\": 15}, \"wrist\": {\"type\": \"opencv\", \"index_or_path\": 2, \"width\": 640, \"height\": 480, \"fps\": 15}}" \
+  --robot.id=my_awesome_follower_arm \
+  --policy.path=KHandsome/Taskone-raw-groot-2nd \
+  --dataset.repo_id=KHandsome/eval_Taskone-raw-groot-2nd \
+  --dataset.single_task="Pick and place each bun into the red tray, then pick and place each baguette piece into the white tray" \
+  --teleop.type=so100_leader --teleop.port=/dev/ttyACM0 --teleop.id=my_awesome_leader_arm \
+  --dataset.episode_time_s=120 \
+  --dataset.reset_time_s=8 \
+  --robot.camera_timeout_ms=5000 \
+  --display_data=false \
+  --resume=true
+
+#policy rollout
+#prefetch large model cache on external drive (keep policy.path as Hub repo id)
+mkdir -p "/media/kobe/Seagate Hub/hf_cache"
+export HF_HOME="/media/kobe/Seagate Hub/hf_cache" #download cache to external drive
+export HF_HUB_DISABLE_XET=1 #disable Xet fallback
+export HF_HUB_ENABLE_HF_TRANSFER=1 #enable fast transfer
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128 # PyTorch allocator to reduce fragmentation
+#hf download KHandsome/Taskone-raw-groot-2nd --repo-type model
+
+export LEROBOT_IGNORE_FIRMWARE_MISMATCH=1 && export CUBLAS_WORKSPACE_CONFIG=:16:8 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:32,garbage_collection_threshold:0.8 && lerobot-rollout --strategy.type=base --policy.path=KHandsome/Taskone-raw-groot-2nd --robot.type=so100_wowskin --robot.wowskin_port=/dev/ttyACM2 --robot.port=/dev/ttyACM0 --robot.cameras='{"base":{"type":"opencv","index_or_path":"/dev/video0","width":640,"height":480,"fps":30,"fourcc":"YUYV","backend":"V4L2","warmup_s":1,"max_age_ms":1000}, "wrist":{"type":"opencv","index_or_path":"/dev/video2","width":640,"height":480,"fps":30,"fourcc":"YUYV","backend":"V4L2","warmup_s":1,"max_age_ms":1000}}' --robot.id=my_awesome_follower_arm --display_data=false --task="Pick and place each bun into the red tray, then pick and place each baguette piece into the white tray" --duration=180 --policy.use_bf16=true
