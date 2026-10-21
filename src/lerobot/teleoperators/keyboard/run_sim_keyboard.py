@@ -199,6 +199,19 @@ def _parse_optional_int(value: str) -> int | None:
     return int(value)
 
 
+def _parse_rotation_degrees(value: str) -> int:
+    text = str(value).strip().lower()
+    if text.startswith("rotate"):
+        text = text[len("rotate") :]
+    elif text.startswith("rot"):
+        text = text[len("rot") :]
+    if text in {"0", "90", "180", "270"}:
+        return int(text)
+    raise argparse.ArgumentTypeError(
+        "Rotation must be one of: 0, 90, 180, 270; or names like rotate90 / rotate180"
+    )
+
+
 class _TeeStream:
     def __init__(self, terminal_stream, log_stream):
         self._terminal_stream = terminal_stream
@@ -283,7 +296,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--side-cam", type=_parse_optional_int, default=None, help="Side camera index or none")
     parser.add_argument("--top-cam", type=_parse_optional_int, default=None, help="Top camera index or none")
-    return parser.parse_args()
+    parser.add_argument(
+        "camera_rotation",
+        nargs="?",
+        default=None,
+        help="Optional rotation to apply to the top camera input, e.g. rotate180, rotate90",
+    )
+    parser.add_argument(
+        "--side-rotation",
+        type=_parse_rotation_degrees,
+        default=0,
+        help="Rotate side camera input before hand detection: 0, 90, 180, 270 or rotate90/rotate180",
+    )
+    parser.add_argument(
+        "--top-rotation",
+        type=_parse_rotation_degrees,
+        default=0,
+        help="Rotate top camera input before hand detection: 0, 90, 180, 270 or rotate90/rotate180",
+    )
+    args = parser.parse_args()
+
+    if args.camera_rotation is not None:
+        args.top_rotation = _parse_rotation_degrees(args.camera_rotation)
+
+    return args
 
 
 def main() -> None:
@@ -338,7 +374,7 @@ def main() -> None:
             _send_default_rerun_blueprint()
 
     handtracker_vision.enable_rerun_logging(cfg.display_data and cfg.display_mode == "rerun")
-    handtracker_vision.init_default_service(args.side_cam, args.top_cam)
+    handtracker_vision.init_default_service(args.side_cam, args.top_cam, args.side_rotation, args.top_rotation)
     try:
         teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
         teleop = make_teleoperator_from_config(cfg.teleop)

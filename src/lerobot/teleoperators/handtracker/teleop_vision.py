@@ -348,6 +348,7 @@ class HandTrackerService:
 
     def _process_frame(self, frame: np.ndarray, landmarker: hand_landmarker.HandLandmarker, label: str) -> tuple[np.ndarray, float | None]:
         display_frame = frame.copy()
+        display_frame = _rotate_frame(display_frame, self._camera_rotation.get(label, 0))
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
 
@@ -584,11 +585,16 @@ class HandTrackerService:
 _default_service: HandTrackerService | None = None
 
 
-def init_default_service(side_cam_index: int | None, top_cam_index: int | None) -> None:
+def init_default_service(
+    side_cam_index: int | None,
+    top_cam_index: int | None,
+    side_rotation_deg: int = 0,
+    top_rotation_deg: int = 0,
+) -> None:
     global _default_service
     if _default_service is not None:
         _default_service.stop()
-    _default_service = HandTrackerService(side_cam_index, top_cam_index)
+    _default_service = HandTrackerService(side_cam_index, top_cam_index, side_rotation_deg, top_rotation_deg)
     _default_service.start()
 
 
