@@ -1,0 +1,17 @@
+{
+  "env": {
+    "name": "gym_hil",
+    "task": "PandaPickCubeKeyboard-v0",
+    "fps": 10
+  },
+  "dataset": {
+    "repo_id": "KHandsome/il_gym",
+    "root": null,
+    "task": "pick_cube",
+    "num_episodes_to_record": 5,
+    "replay_episode": null,
+    "push_to_hub": false
+  },
+  "mode": null,
+  "device": "mps"
+}

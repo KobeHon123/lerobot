@@ -20,6 +20,7 @@ from .configuration_keyboard import (
     KeyboardTeleopConfig,
 )
 from .teleop_keyboard import KeyboardEndEffectorTeleop, KeyboardRoverTeleop, KeyboardTeleop
+from .so101_keyboard import KeyboardSOLeader, KeyboardSOLeaderConfig
 
 __all__ = [
     "KeyboardTeleopConfig",
@@ -28,4 +29,6 @@ __all__ = [
     "KeyboardEndEffectorTeleop",
     "KeyboardRoverTeleopConfig",
     "KeyboardRoverTeleop",
+    "KeyboardSOLeader",
+    "KeyboardSOLeaderConfig",
 ]
