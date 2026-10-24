@@ -33,10 +33,14 @@ if not MODEL_PATH.exists():
     )
 
 ALLOWED_LANDMARKS = {0, 1, 2, 3, 4, 5, 6, 7, 8}
+DEFAULT_XY_SCALE_M = 0.05
+MIN_XY_SCALE_M = 0.01
+MAX_XY_SCALE_M = 0.20
 DEFAULT_FRAME_WIDTH = 640
 DEFAULT_FRAME_HEIGHT = 480
 BLACK_FRAME = np.zeros((DEFAULT_FRAME_HEIGHT, DEFAULT_FRAME_WIDTH, 3), dtype=np.uint8)
 _RERUN_LOGGING_ENABLED = False
+_RERUN_LOGGING_MODE = "off"
 LOG_DIR = Path(__file__).with_name("logs")
 _RUN_LOGGER: logging.Logger | None = None
 _RUN_LOG_PATH: Path | None = None
@@ -44,6 +48,10 @@ _RUN_LOG_PATH: Path | None = None
 
 def _black_frame() -> np.ndarray:
     return BLACK_FRAME.copy()
+
+
+def _is_valid_frame(frame: np.ndarray | None) -> bool:
+    return frame is not None and isinstance(frame, np.ndarray) and frame.size > 0
 
 
 def _make_landmarker() -> hand_landmarker.HandLandmarker:
@@ -61,9 +69,22 @@ def _make_landmarker() -> hand_landmarker.HandLandmarker:
     return hand_landmarker.HandLandmarker.create_from_options(options)
 
 
-def enable_rerun_logging(enabled: bool = True) -> None:
-    global _RERUN_LOGGING_ENABLED
-    _RERUN_LOGGING_ENABLED = enabled
+def enable_rerun_logging(enabled: bool = True, mode: str | None = "off") -> None:
+    global _RERUN_LOGGING_ENABLED, _RERUN_LOGGING_MODE
+    _RERUN_LOGGING_ENABLED = bool(enabled)
+    if mode is not None:
+        _RERUN_LOGGING_MODE = str(mode).lower()
+
+
+def set_rerun_logging_mode(mode: str) -> None:
+    global _RERUN_LOGGING_MODE
+    if mode is None:
+        return
+    mode_name = str(mode).lower()
+    if mode_name in {"off", "lightweight", "full"}:
+        _RERUN_LOGGING_MODE = mode_name
+    else:
+        _RERUN_LOGGING_MODE = "off"
 
 
 def _setup_run_logger() -> logging.Logger:
@@ -112,6 +133,17 @@ def _rotate_frame(frame: np.ndarray, rotation_deg: int = 0) -> np.ndarray:
     return frame
 
 
+def _mirror_frame(frame: np.ndarray, x_mirror: bool = False, y_mirror: bool = False) -> np.ndarray:
+    """Rotation is applied first; xmirror flips left/right, ymirror flips up/down of the result."""
+    if x_mirror and y_mirror:
+        return cv2.flip(frame, -1)
+    if x_mirror:
+        return cv2.flip(frame, 1)
+    if y_mirror:
+        return cv2.flip(frame, 0)
+    return frame
+
+
 class HandTrackerService:
     def __init__(
         self,
@@ -119,6 +151,8 @@ class HandTrackerService:
         top_cam_index: int | None,
         side_rotation_deg: int = 0,
         top_rotation_deg: int = 0,
+        side_mirror: tuple[bool, bool] = (False, False),
+        top_mirror: tuple[bool, bool] = (False, False),
     ):
         self.side_cam_index = side_cam_index
         self.top_cam_index = top_cam_index
@@ -126,6 +160,10 @@ class HandTrackerService:
             "side": int(side_rotation_deg) % 360,
             "top": int(top_rotation_deg) % 360,
         }
+        self._camera_mirror = {"side": tuple(side_mirror), "top": tuple(top_mirror)}
+        self._timing_sums = {"read": 0.0, "process": 0.0, "rerun": 0.0, "loop": 0.0}
+        self._timing_count = 0
+        self._timing_last_report = time.monotonic()
         self._logger = _setup_run_logger()
         self._lock = threading.Lock()
         self._latest_gripper_fraction = 0.0
@@ -145,7 +183,7 @@ class HandTrackerService:
         self._read_failure_limit = 10
         self._read_failure_counts = {"side": 0, "top": 0}
         self._top_xy_mapper = RelativeXYMapper()
-        self._xy_sensitivity = 1.0
+        self._xy_scale = DEFAULT_XY_SCALE_M
 
     def start(self) -> None:
         if self._running:
@@ -199,14 +237,14 @@ class HandTrackerService:
         with self._lock:
             self._smoothing_alpha = min(1.0, max(0.05, self._smoothing_alpha + delta))
 
-    def adjust_xy_sensitivity(self, delta: float) -> float:
+    def adjust_xy_scale(self, delta_m: float) -> float:
         with self._lock:
-            self._xy_sensitivity = min(4.0, max(0.2, self._xy_sensitivity + delta))
-            return float(self._xy_sensitivity)
+            self._xy_scale = min(MAX_XY_SCALE_M, max(MIN_XY_SCALE_M, self._xy_scale + delta_m))
+            return float(self._xy_scale)
 
-    def get_xy_sensitivity(self) -> float:
+    def get_xy_scale(self) -> float:
         with self._lock:
-            return float(self._xy_sensitivity)
+            return float(self._xy_scale)
 
     def _open_resources(self) -> None:
         for label, cam_index in (("side", self.side_cam_index), ("top", self.top_cam_index)):
@@ -291,7 +329,7 @@ class HandTrackerService:
     ) -> dict[str, float]:
         with self._lock:
             state = self._top_xy_mapper.update(midpoint)
-            sensitivity = float(self._xy_sensitivity)
+            scale = float(self._xy_scale)
 
         snapped_orientation = self._snap_orientation_to_180(orientation_vector)
 
@@ -334,14 +372,14 @@ class HandTrackerService:
         dx_norm = aligned_x_px / max_delta if max_delta > 0 else 0.0
         dy_norm = aligned_y_px / max_delta if max_delta > 0 else 0.0
 
-        dx_norm = max(-1.0, min(1.0, dx_norm * sensitivity))
-        dy_norm = max(-1.0, min(1.0, dy_norm * sensitivity))
+        dx_norm = max(-1.0, min(1.0, dx_norm))
+        dy_norm = max(-1.0, min(1.0, dy_norm))
 
         state["dx_px"] = float(aligned_x_px)
         state["dy_px"] = float(aligned_y_px)
         state["dx_norm"] = float(dx_norm)
         state["dy_norm"] = float(dy_norm)
-        state["xy_sensitivity"] = float(sensitivity)
+        state["xy_scale"] = float(scale)
         if snapped_deg is not None:
             state["orientation_deg"] = float(snapped_deg)
         return state
@@ -349,6 +387,8 @@ class HandTrackerService:
     def _process_frame(self, frame: np.ndarray, landmarker: hand_landmarker.HandLandmarker, label: str) -> tuple[np.ndarray, float | None]:
         display_frame = frame.copy()
         display_frame = _rotate_frame(display_frame, self._camera_rotation.get(label, 0))
+        x_mirror, y_mirror = self._camera_mirror.get(label, (False, False))
+        display_frame = _mirror_frame(display_frame, x_mirror, y_mirror)
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
 
@@ -383,7 +423,6 @@ class HandTrackerService:
                 y_axis = top_snapped_orientation[0]
 
             x_axis = (float(y_axis[1]), float(-y_axis[0]))
-
             x_end = (int(origin_x + x_axis[0] * axis_len), int(origin_y + x_axis[1] * axis_len))
             y_end = (int(origin_x + y_axis[0] * axis_len), int(origin_y + y_axis[1] * axis_len))
 
@@ -461,34 +500,44 @@ class HandTrackerService:
             color = (0, 0, 255)
 
         if label == "top":
-            status_text += f"   dx_norm={float(self._latest_xy.get('top', {}).get('dx_norm', 0.0)):.2f} dy_norm={float(self._latest_xy.get('top', {}).get('dy_norm', 0.0)):.2f}"
-            if top_snapped_orientation is not None and top_snapped_orientation[1] is not None:
-                status_text += f"   Dir: {top_snapped_orientation[1]:.0f}° snap"
+            rel_xy = None
+            if top_midpoint is not None:
+                rel_xy = self._compute_relative_top_xy(top_midpoint, top_orientation_vector)
+            with self._lock:
+                self._latest_xy["top"] = rel_xy
+                scale_now = float(self._xy_scale)
 
-            latest_top_xy = self._latest_xy.get("top") if isinstance(self._latest_xy, dict) else None
-            dx_norm_val = float(latest_top_xy.get("dx_norm", 0.0)) if isinstance(latest_top_xy, dict) else 0.0
-            dy_norm_val = float(latest_top_xy.get("dy_norm", 0.0)) if isinstance(latest_top_xy, dict) else 0.0
-            scale_text = f"XY scale {self._xy_scale:.3f} m"
+            dx_norm_val = float(rel_xy.get("dx_norm", 0.0)) if rel_xy is not None else 0.0
+            dy_norm_val = float(rel_xy.get("dy_norm", 0.0)) if rel_xy is not None else 0.0
+
+            if top_snapped_orientation is not None and top_snapped_orientation[1] is not None:
+                status_text += f"   Dir: {top_snapped_orientation[1]:.0f}°"
+
+            scale_text = f"XY scale {scale_now:.3f} m"
             norms_text = f"dx {dx_norm_val:.2f}  dy {dy_norm_val:.2f}"
-            cv2.rectangle(display_frame, (15, 108), (380, 190), (0, 0, 0), -1)
-            cv2.putText(display_frame, norms_text, (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-            cv2.putText(display_frame, scale_text, (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+            cv2.rectangle(display_frame, (15, 108), (380, 225), (0, 0, 0), -1)
+            cv2.putText(display_frame, norms_text, (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3)
+            cv2.putText(display_frame, scale_text, (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
             if top_snapped_orientation is not None and top_snapped_orientation[1] is not None:
                 dir_text = f"DIR {top_snapped_orientation[1]:.0f}°"
-                cv2.putText(display_frame, dir_text, (22, 212), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 180, 80), 2)
+                cv2.putText(display_frame, dir_text, (22, 212), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 180, 80), 2)
 
         cv2.rectangle(display_frame, (0, 0), (width, 100), (0, 0, 0), -1)
         cv2.putText(display_frame, status_text, (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 2)
 
-        if label == "top" and top_midpoint is not None:
-            rel_xy = self._compute_relative_top_xy(top_midpoint, top_orientation_vector)
-            with self._lock:
-                self._latest_xy["top"] = rel_xy
-        elif label == "top":
-            with self._lock:
-                self._latest_xy["top"] = None
-
         return cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB), norm_val_to_show
+
+    def _safe_process_frame(
+        self,
+        frame: np.ndarray,
+        landmarker: hand_landmarker.HandLandmarker,
+        label: str,
+    ) -> tuple[np.ndarray, float | None]:
+        try:
+            return self._process_frame(frame, landmarker, label)
+        except Exception:
+            self._logger.exception("%s frame processing failed", label)
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), None
 
     def _choose_gripper_fraction(self, side_fraction: float | None, top_fraction: float | None) -> float:
         if top_fraction is not None: #prioritize top camera for now
@@ -496,6 +545,64 @@ class HandTrackerService:
         if side_fraction is not None:
             return side_fraction
         return self._latest_gripper_fraction
+
+    def _record_timing(self, read_s: float, process_s: float, rerun_s: float, loop_s: float) -> None:
+        sums = self._timing_sums
+        sums["read"] += read_s
+        sums["process"] += process_s
+        sums["rerun"] += rerun_s
+        sums["loop"] += loop_s
+        self._timing_count += 1
+        now = time.monotonic()
+        if now - self._timing_last_report < 5.0:
+            return
+        n = max(1, self._timing_count)
+        self._logger.info(
+            "Handtracker loop avg over %d iters: read=%.1fms process(mediapipe+draw)=%.1fms rerun=%.1fms loop=%.1fms (%.1f Hz)",
+            n,
+            sums["read"] / n * 1000,
+            sums["process"] / n * 1000,
+            sums["rerun"] / n * 1000,
+            sums["loop"] / n * 1000,
+            n / (now - self._timing_last_report),
+        )
+        for key in sums:
+            sums[key] = 0.0
+        self._timing_count = 0
+        self._timing_last_report = now
+
+    def _log_rerun(self, side_frame: np.ndarray, top_frame: np.ndarray) -> None:
+        try:
+            import rerun as rr
+        except Exception as e:
+            self._logger.warning("Failed to import rerun: %s", e)
+            return
+
+        top_state = self.get_latest_xy().get("top")
+        detected = isinstance(top_state, dict)
+        dx_norm = float(top_state.get("dx_norm", 0.0)) if detected else 0.0
+        dy_norm = float(top_state.get("dy_norm", 0.0)) if detected else 0.0
+        scale = self.get_xy_scale()
+
+        rr.log("hand_tracker/dx_norm", rr.Scalars(dx_norm))
+        rr.log("hand_tracker/dy_norm", rr.Scalars(dy_norm))
+        rr.log("hand_tracker/xy_scale", rr.Scalars(scale))
+        rr.log("hand_tracker/hand_detected", rr.Scalars(1.0 if detected else 0.0))
+        rr.log(
+            "hand_tracker/status",
+            rr.TextDocument(
+                f"hand {'detected' if detected else 'NOT detected'}\n\n"
+                f"dx_norm = {dx_norm:+.3f}\n\ndy_norm = {dy_norm:+.3f}\n\nxy_scale = {scale:.3f} m"
+            ),
+        )
+
+        if _RERUN_LOGGING_MODE == "full":
+            try:
+                rr.log("hand_tracker/side", rr.Image(side_frame))
+                rr.log("hand_tracker/top", rr.Image(top_frame))
+                rr.log("hand_tracker/gripper_fraction", rr.Scalars(self.get_gripper_fraction()))
+            except Exception as e:
+                self._logger.warning("Rerun image/gripper log failed: %s", e)
 
     def _run_loop(self) -> None:
         target_dt = 1.0 / 15.0
@@ -505,15 +612,17 @@ class HandTrackerService:
             top_frame = _black_frame()
             side_fraction = None
             top_fraction = None
+            read_time = 0.0
 
             side_cap = self._caps["side"]
             side_landmarker = self._landmarkers["side"]
             if side_cap is not None and side_landmarker is not None:
+                t_read = time.monotonic()
                 ok, frame = side_cap.read()
-                if ok:
+                read_time += time.monotonic() - t_read
+                if ok and _is_valid_frame(frame):
                     self._read_failure_counts["side"] = 0
-                    frame = cv2.flip(frame, 1)
-                    side_frame, side_fraction = self._process_frame(frame, side_landmarker, "side")
+                    side_frame, side_fraction = self._safe_process_frame(frame, side_landmarker, "side")
                 else:
                     self._read_failure_counts["side"] += 1
                     self._logger.warning(
@@ -526,15 +635,17 @@ class HandTrackerService:
                         side_cap.release()
                         self._caps["side"] = None
                         self._landmarkers["side"] = None
+                    side_frame = self._latest_frames.get("side", _black_frame())
 
             top_cap = self._caps["top"]
             top_landmarker = self._landmarkers["top"]
             if top_cap is not None and top_landmarker is not None:
+                t_read = time.monotonic()
                 ok, frame = top_cap.read()
-                if ok:
+                read_time += time.monotonic() - t_read
+                if ok and _is_valid_frame(frame):
                     self._read_failure_counts["top"] = 0
-                    frame = cv2.flip(frame, 1)
-                    top_frame, top_fraction = self._process_frame(frame, top_landmarker, "top")
+                    top_frame, top_fraction = self._safe_process_frame(frame, top_landmarker, "top")
                 else:
                     self._read_failure_counts["top"] += 1
                     self._logger.warning(
@@ -547,6 +658,7 @@ class HandTrackerService:
                         top_cap.release()
                         self._caps["top"] = None
                         self._landmarkers["top"] = None
+                    top_frame = self._latest_frames.get("top", _black_frame())
 
             with self._lock:
                 self._latest_frames["side"] = side_frame
@@ -555,26 +667,14 @@ class HandTrackerService:
                 self._latest_camera_fractions["top"] = top_fraction
                 self._latest_gripper_fraction = self._choose_gripper_fraction(side_fraction, top_fraction)
 
-            if _RERUN_LOGGING_ENABLED:
-                try:
-                    import rerun as rr
-                except Exception as e:
-                    self._logger.warning("Failed to import rerun: %s", e)
-                else:
-                    try:
-                        rr.log("hand_tracker/side", rr.Image(side_frame))
-                    except Exception as e:
-                        self._logger.warning("Side image Rerun log failed: %s", e)
-                    try:
-                        rr.log("hand_tracker/top", rr.Image(top_frame))
-                    except Exception as e:
-                        self._logger.warning("Top image Rerun log failed: %s", e)
-                    try:
-                        rr.log("hand_tracker/gripper_fraction", rr.Scalars(self.get_gripper_fraction()))
-                    except Exception as e:
-                        self._logger.warning("Gripper scalar Rerun log failed: %s", e)
+            t_process_end = time.monotonic()
+            t_rerun_start = t_process_end
+            if _RERUN_LOGGING_ENABLED and _RERUN_LOGGING_MODE in {"lightweight", "full"}:
+                self._log_rerun(side_frame, top_frame)
+            t_rerun_end = time.monotonic()
 
             elapsed = time.monotonic() - loop_start
+            self._record_timing(read_time, (t_process_end - loop_start) - read_time, t_rerun_end - t_rerun_start, elapsed)
             if elapsed < target_dt:
                 time.sleep(target_dt - elapsed)
 
@@ -590,11 +690,15 @@ def init_default_service(
     top_cam_index: int | None,
     side_rotation_deg: int = 0,
     top_rotation_deg: int = 0,
+    side_mirror: tuple[bool, bool] = (False, False),
+    top_mirror: tuple[bool, bool] = (False, False),
 ) -> None:
     global _default_service
     if _default_service is not None:
         _default_service.stop()
-    _default_service = HandTrackerService(side_cam_index, top_cam_index, side_rotation_deg, top_rotation_deg)
+    _default_service = HandTrackerService(
+        side_cam_index, top_cam_index, side_rotation_deg, top_rotation_deg, side_mirror, top_mirror
+    )
     _default_service.start()
 
 
@@ -636,16 +740,16 @@ def adjust_smoothing(delta: float) -> None:
         _default_service.adjust_smoothing(delta)
 
 
-def adjust_xy_sensitivity(delta: float) -> float:
+def adjust_xy_scale(delta_m: float) -> float:
     if _default_service is not None:
-        return _default_service.adjust_xy_sensitivity(delta)
-    return 1.0
+        return _default_service.adjust_xy_scale(delta_m)
+    return DEFAULT_XY_SCALE_M
 
 
-def get_xy_sensitivity() -> float:
+def get_xy_scale() -> float:
     if _default_service is not None:
-        return _default_service.get_xy_sensitivity()
-    return 1.0
+        return _default_service.get_xy_scale()
+    return DEFAULT_XY_SCALE_M
 
 
 def shutdown_default_service() -> None:

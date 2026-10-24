@@ -254,6 +254,10 @@ def _send_default_rerun_blueprint() -> None:
             rrb.Spatial2DView(origin="observation.wrist"),
             rrb.Spatial2DView(origin="hand_tracker/side"),
             rrb.Spatial2DView(origin="hand_tracker/top"),
+            rrb.TextDocumentView(origin="hand_tracker/status"),
+            rrb.TimeSeriesView(origin="hand_tracker/dx_norm"),
+            rrb.TimeSeriesView(origin="hand_tracker/dy_norm"),
+            rrb.TimeSeriesView(origin="hand_tracker/xy_scale"),
             rrb.TimeSeriesView(origin="hand_tracker/gripper_fraction"),
             rrb.TimeSeriesView(origin="teleop/target_ee"),
             rrb.TimeSeriesView(origin="teleop/observed_ee"),
@@ -297,11 +301,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side-cam", type=_parse_optional_int, default=None, help="Side camera index or none")
     parser.add_argument("--top-cam", type=_parse_optional_int, default=None, help="Top camera index or none")
     parser.add_argument(
-        "camera_rotation",
-        nargs="?",
-        default=None,
-        help="Optional rotation to apply to the top camera input, e.g. rotate180, rotate90",
+        "camera_options",
+        nargs="*",
+        default=[],
+        help="Optional top camera transforms, in any order: rotate90/rotate180/rotate270, xmirror, ymirror. "
+        "e.g. --top-cam 1 rotate180 xmirror. No mirroring is applied by default.",
     )
+    parser.add_argument("--side-xmirror", action="store_true", help="Mirror side camera left/right")
+    parser.add_argument("--side-ymirror", action="store_true", help="Mirror side camera up/down")
     parser.add_argument(
         "--side-rotation",
         type=_parse_rotation_degrees,
@@ -316,8 +323,21 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
-    if args.camera_rotation is not None:
-        args.top_rotation = _parse_rotation_degrees(args.camera_rotation)
+    args.top_xmirror = False
+    args.top_ymirror = False
+    for option in args.camera_options:
+        name = option.strip().lower()
+        if name == "xmirror":
+            args.top_xmirror = True
+        elif name == "ymirror":
+            args.top_ymirror = True
+        else:
+            try:
+                args.top_rotation = _parse_rotation_degrees(name)
+            except argparse.ArgumentTypeError:
+                parser.error(
+                    f"Unknown camera option '{option}'. Expected rotate90/rotate180/rotate270, xmirror or ymirror."
+                )
 
     return args
 
@@ -373,8 +393,15 @@ def main() -> None:
         if cfg.display_mode == "rerun":
             _send_default_rerun_blueprint()
 
-    handtracker_vision.enable_rerun_logging(cfg.display_data and cfg.display_mode == "rerun")
-    handtracker_vision.init_default_service(args.side_cam, args.top_cam, args.side_rotation, args.top_rotation)
+    handtracker_vision.enable_rerun_logging(cfg.display_data and cfg.display_mode == "rerun", mode="off")
+    handtracker_vision.init_default_service(
+        args.side_cam,
+        args.top_cam,
+        args.side_rotation,
+        args.top_rotation,
+        (args.side_xmirror, args.side_ymirror),
+        (args.top_xmirror, args.top_ymirror),
+    )
     try:
         teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
         teleop = make_teleoperator_from_config(cfg.teleop)
