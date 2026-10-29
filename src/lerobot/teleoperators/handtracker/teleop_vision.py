@@ -243,6 +243,10 @@ class HandTrackerService:
             return
         with self._lock:
             self._top_xy_mapper.reset(midpoint)
+            # Drop the stale delta so the next read already reflects the new origin.
+            top_state = self._latest_xy.get("top")
+            if top_state is not None:
+                top_state.update({"dx_px": 0.0, "dy_px": 0.0, "dx_norm": 0.0, "dy_norm": 0.0})
 
     def adjust_smoothing(self, delta: float) -> None:
         with self._lock:
@@ -253,6 +257,9 @@ class HandTrackerService:
             return
         with self._lock:
             self._side_z_mapper.reset(midpoint)
+            side_state = self._latest_xy.get("side")
+            if side_state is not None:
+                side_state.update({"dz_px": 0.0, "dz_norm": 0.0})
 
     def adjust_z_scale(self, delta_m: float) -> float:
         with self._lock:

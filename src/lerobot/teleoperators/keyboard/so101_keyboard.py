@@ -11,6 +11,10 @@ Two modes are supported:
 In both modes, `1` = keyboard mode, `2` = lightweight handtracker logging,
 `3` = full handtracker video logging, and `q` / `e` tune the active handtracker
 motion scale while in handtracker mode.
+
+In handtracker modes (`2` / `3`), `4` toggles the XY mapping and `5` toggles the Z
+mapping. A disabled axis group keeps its last position. Re-enabling re-bases the
+hand origin to the current hand position, so the arm does not jump.
 """
 
 from __future__ import annotations
@@ -81,6 +85,10 @@ class KeyboardSOLeader(Teleoperator):
         self._last_relative_xy: dict[str, float] = {"dx_px": 0.0, "dy_px": 0.0, "dx_norm": 0.0, "dy_norm": 0.0}
         self._last_xy_valid_t: float = 0.0
         self._last_relative_z: float = 0.0
+        self._xy_mapping_enabled: bool = True
+        self._z_mapping_enabled: bool = True
+        self._xy_rebase_pending: bool = False
+        self._z_rebase_pending: bool = False
         self._last_z_valid_t: float = 0.0
         self._z_scale: float = 0.08
         self._xy_hold_timeout_s: float = 0.35
@@ -154,7 +162,8 @@ class KeyboardSOLeader(Teleoperator):
                 "ee.y": float(self._state["ee.y"]),
                 "ee.z": float(self._state["ee.z"]),
             }
-            self._calibrate_top_xy_from_current_hand()
+            self._xy_rebase_pending = True
+            self._z_rebase_pending = True
         self._control_mode = mode
         logger.info("Control mode switched to: %s", self._control_mode)
 
@@ -222,26 +231,73 @@ class KeyboardSOLeader(Teleoperator):
             self._xy_scale = float(self._handtracker.get_xy_scale())
         return self._xy_scale
 
-    def _calibrate_top_xy_from_current_hand(self) -> bool:
-        """Reset the hand reference points (top cam for XY, side cam for Z) to the current hand."""
+    def _calibrate_hand_reference(self, xy: bool = True, z: bool = True) -> bool:
+        """Reset the hand origin (top cam for XY, side cam for Z) to the current hand.
+
+        Returns True only if every requested axis group was calibrated, i.e. the
+        corresponding hand was detected right now.
+        """
         if self._handtracker is None:
             return False
-        calibrated = False
+        ok = True
         try:
             latest = self._handtracker.get_latest_xy()
-            top = latest.get("top")
-            if top is not None and hasattr(self._handtracker, "calibrate_top_xy"):
-                self._handtracker.calibrate_top_xy((top.get("mid_x", 0.0), top.get("mid_y", 0.0)))
-                logger.info("Calibrated top XY midpoint from current hand pose")
-                calibrated = True
-            side = latest.get("side")
-            if side is not None and hasattr(self._handtracker, "calibrate_side_z"):
-                self._handtracker.calibrate_side_z((side.get("mid_x", 0.0), side.get("mid_y", 0.0)))
-                logger.info("Calibrated side Z midpoint from current hand pose")
-                calibrated = True
+            if xy:
+                top = latest.get("top")
+                if top is not None and hasattr(self._handtracker, "calibrate_top_xy"):
+                    self._handtracker.calibrate_top_xy((top.get("mid_x", 0.0), top.get("mid_y", 0.0)))
+                    logger.info("Calibrated top XY midpoint from current hand pose")
+                else:
+                    ok = False
+            if z:
+                side = latest.get("side")
+                if side is not None and hasattr(self._handtracker, "calibrate_side_z"):
+                    self._handtracker.calibrate_side_z((side.get("mid_x", 0.0), side.get("mid_y", 0.0)))
+                    logger.info("Calibrated side Z midpoint from current hand pose")
+                else:
+                    ok = False
         except Exception:
             logger.exception("Failed to calibrate hand reference")
-        return calibrated
+            return False
+        return ok
+
+    def _try_rebase_xy(self) -> bool:
+        if not self._calibrate_hand_reference(xy=True, z=False):
+            return False
+        self._motion_baseline["ee.x"] = float(self._state["ee.x"])
+        self._motion_baseline["ee.y"] = float(self._state["ee.y"])
+        self._last_relative_xy = {"dx_px": 0.0, "dy_px": 0.0, "dx_norm": 0.0, "dy_norm": 0.0}
+        self._last_xy_valid_t = time.monotonic()
+        self._xy_rebase_pending = False
+        return True
+
+    def _try_rebase_z(self) -> bool:
+        if not self._calibrate_hand_reference(xy=False, z=True):
+            return False
+        self._motion_baseline["ee.z"] = float(self._state["ee.z"])
+        self._last_relative_z = 0.0
+        self._last_z_valid_t = time.monotonic()
+        self._z_rebase_pending = False
+        return True
+
+    def _toggle_mapping(self, axes: str) -> None:
+        if self._control_mode != CONTROL_MODE_HANDTRACKER:
+            logger.info("%s mapping toggle ignored: only available in handtracker modes (2 / 3)", axes)
+            return
+        if axes == "XY":
+            self._xy_mapping_enabled = not self._xy_mapping_enabled
+            self._xy_rebase_pending = self._xy_mapping_enabled
+            enabled = self._xy_mapping_enabled
+        else:
+            self._z_mapping_enabled = not self._z_mapping_enabled
+            self._z_rebase_pending = self._z_mapping_enabled
+            enabled = self._z_mapping_enabled
+        logger.info(
+            "%s mapping %s%s",
+            axes,
+            "ENABLED" if enabled else "DISABLED (holding last position)",
+            " - waiting for hand to re-base origin" if enabled else "",
+        )
 
     def _adjust_z_scale(self, delta_m: float) -> None:
         if self._handtracker is not None and hasattr(self._handtracker, "adjust_z_scale"):
@@ -290,6 +346,14 @@ class KeyboardSOLeader(Teleoperator):
             logger.exception("Failed to read handtracker relative XY")
             return None
 
+    @staticmethod
+    def _mapping_status(live: bool, enabled: bool, rebase_pending: bool) -> str:
+        if not enabled:
+            return "disabled"
+        if rebase_pending:
+            return "waiting for hand"
+        return "live" if live else "held"
+
     def _read_relative_z(self) -> float | None:
         if self._handtracker is None or not hasattr(self._handtracker, "get_latest_xy"):
             return None
@@ -308,7 +372,13 @@ class KeyboardSOLeader(Teleoperator):
             return None
 
     def _apply_motion_from_handtracker(self) -> None:
-        xy = self._read_relative_xy()
+        xy = None
+        if self._xy_mapping_enabled:
+            if self._xy_rebase_pending:
+                if self._try_rebase_xy():
+                    logger.info("XY origin re-based at ee.x=%.3f ee.y=%.3f", self._state["ee.x"], self._state["ee.y"])
+            else:
+                xy = self._read_relative_xy()
         if xy is not None:
             scale = self._current_xy_scale()
             target_x = self._motion_baseline["ee.x"] + xy["dx_norm"] * scale
@@ -316,7 +386,13 @@ class KeyboardSOLeader(Teleoperator):
             self._state["ee.x"] = self._clamp_state("ee.x", target_x)
             self._state["ee.y"] = self._clamp_state("ee.y", target_y)
 
-        dz_norm = self._read_relative_z()
+        dz_norm = None
+        if self._z_mapping_enabled:
+            if self._z_rebase_pending:
+                if self._try_rebase_z():
+                    logger.info("Z origin re-based at ee.z=%.3f", self._state["ee.z"])
+            else:
+                dz_norm = self._read_relative_z()
         if dz_norm is not None:
             target_z = self._motion_baseline["ee.z"] + dz_norm * self._current_z_scale()
             self._state["ee.z"] = self._clamp_state("ee.z", target_z)
@@ -329,8 +405,8 @@ class KeyboardSOLeader(Teleoperator):
                 self._state["ee.x"],
                 self._state["ee.y"],
                 self._state["ee.z"],
-                "live" if xy is not None else "held",
-                "live" if dz_norm is not None else "held",
+                self._mapping_status(xy is not None, self._xy_mapping_enabled, self._xy_rebase_pending),
+                self._mapping_status(dz_norm is not None, self._z_mapping_enabled, self._z_rebase_pending),
             )
 
     def get_action(self) -> dict[str, float]:
@@ -369,6 +445,12 @@ class KeyboardSOLeader(Teleoperator):
                         self._set_control_mode(CONTROL_MODE_HANDTRACKER)
                         self._set_handtracker_logging_mode("full")
                         return
+                    if lowered == "4":
+                        self._toggle_mapping("XY")
+                        return
+                    if lowered == "5":
+                        self._toggle_mapping("Z")
+                        return
 
                     if lowered == "w":
                         self._move_keyboard_z(self._keyboard_step)
@@ -379,7 +461,7 @@ class KeyboardSOLeader(Teleoperator):
                     elif lowered == "c" and self._handtracker is not None and hasattr(self._handtracker, "calibrate_closed"):
                         self._handtracker.calibrate_closed()
                     elif lowered == "x":
-                        self._calibrate_top_xy_from_current_hand()
+                        self._calibrate_hand_reference()
                     elif lowered == "q" and self._control_mode == CONTROL_MODE_HANDTRACKER:
                         self._adjust_xy_scale(-XY_SCALE_STEP_M)
                         return
