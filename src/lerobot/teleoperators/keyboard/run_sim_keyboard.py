@@ -258,6 +258,7 @@ def _send_default_rerun_blueprint() -> None:
             rrb.TimeSeriesView(origin="hand_tracker/dx_norm"),
             rrb.TimeSeriesView(origin="hand_tracker/dy_norm"),
             rrb.TimeSeriesView(origin="hand_tracker/xy_scale"),
+            rrb.TimeSeriesView(origin="hand_tracker/dz_norm"),
             rrb.TimeSeriesView(origin="hand_tracker/gripper_fraction"),
             rrb.TimeSeriesView(origin="teleop/target_ee"),
             rrb.TimeSeriesView(origin="teleop/observed_ee"),

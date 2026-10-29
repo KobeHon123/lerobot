@@ -4,8 +4,9 @@
 
 Two modes are supported:
 - Keyboard-only: arrows control `ee.x` / `ee.y`, `w` / `s` control `ee.z`.
-- Handtracker + keyboard: handtracker controls `ee.x` / `ee.y`, `w` / `s`
-    control `ee.z`.
+- Handtracker + keyboard: the top camera controls `ee.x` / `ee.y`, the side camera
+    controls `ee.z` (hand height). `w` / `s` shift the z reference. `q` / `e` tune the
+    XY scale and `,` / `.` tune the Z scale.
 
 In both modes, `1` = keyboard mode, `2` = lightweight handtracker logging,
 `3` = full handtracker video logging, and `q` / `e` tune the active handtracker
@@ -31,6 +32,15 @@ EE_GRIPPER_KEY = "ee.gripper_pos"
 CONTROL_MODE_KEYBOARD = "keyboard"
 CONTROL_MODE_HANDTRACKER = "handtracker"
 XY_SCALE_STEP_M = 0.005
+# User-frame XY limits (+y = forward in the overhead view). The sim accepts a
+# +/-0.55 m box with a max TCP reach of ~0.5457 m. Measured on the sim: sideways
+# +/-0.40 m and forward up to ~0.45 m are reached; the area close to the base is not.
+EE_X_LIMIT_M = 0.40
+EE_Y_MIN_M = -0.25
+EE_Y_MAX_M = 0.45
+EE_Z_MIN_M = 0.02
+EE_Z_MAX_M = 0.40
+Z_SCALE_STEP_M = 0.01
 LOCKED_ORIENTATION = {"ee.wx": 0.0, "ee.wy": 0.0, "ee.wz": 0.0}
 
 
@@ -65,11 +75,14 @@ class KeyboardSOLeader(Teleoperator):
         self._state["ee.z"] = 0.15
         self._listener = None
         self._control_mode: str = CONTROL_MODE_KEYBOARD
-        self._motion_baseline: dict[str, float] = {"ee.x": 0.0, "ee.y": 0.0}
+        self._motion_baseline: dict[str, float] = {"ee.x": 0.0, "ee.y": 0.0, "ee.z": 0.15}
         self._xy_scale: float = 0.05
         self._keyboard_step: float = self.config.step_deg * 0.01
         self._last_relative_xy: dict[str, float] = {"dx_px": 0.0, "dy_px": 0.0, "dx_norm": 0.0, "dy_norm": 0.0}
         self._last_xy_valid_t: float = 0.0
+        self._last_relative_z: float = 0.0
+        self._last_z_valid_t: float = 0.0
+        self._z_scale: float = 0.08
         self._xy_hold_timeout_s: float = 0.35
         self._last_hand_log_t: float = 0.0
         self._hand_log_interval_s: float = 0.5
@@ -112,12 +125,14 @@ class KeyboardSOLeader(Teleoperator):
 
     def _clamp_state(self, key: str, value: float) -> float:
         if key == "ee.z":
-            return max(-1.0, min(1.0, value))
+            return max(EE_Z_MIN_M, min(EE_Z_MAX_M, value))
         if key == EE_GRIPPER_KEY:
             return max(0.0, min(100.0, value))
         if key in self._orientation_lock:
             return self._orientation_lock[key]
-        return max(-0.25, min(0.25, value))
+        if key == "ee.y":
+            return max(EE_Y_MIN_M, min(EE_Y_MAX_M, value))
+        return max(-EE_X_LIMIT_M, min(EE_X_LIMIT_M, value))
 
     def _apply_orientation_lock(self) -> None:
         for key, value in self._orientation_lock.items():
@@ -137,6 +152,7 @@ class KeyboardSOLeader(Teleoperator):
             self._motion_baseline = {
                 "ee.x": float(self._state["ee.x"]),
                 "ee.y": float(self._state["ee.y"]),
+                "ee.z": float(self._state["ee.z"]),
             }
             self._calibrate_top_xy_from_current_hand()
         self._control_mode = mode
@@ -167,6 +183,7 @@ class KeyboardSOLeader(Teleoperator):
         self._motion_baseline = {
             "ee.x": float(self._state["ee.x"]),
             "ee.y": float(self._state["ee.y"]),
+            "ee.z": float(self._state["ee.z"]),
         }
         self._orientation_lock = {
             "ee.wx": float(self._state["ee.wx"]),
@@ -180,6 +197,7 @@ class KeyboardSOLeader(Teleoperator):
         self._state = {key: 0.0 for key in self.motors}
         self._state["ee.z"] = 0.15
         self._apply_orientation_lock()
+        self._motion_baseline = {"ee.x": 0.0, "ee.y": 0.0, "ee.z": 0.15}
         logger.info("Reset end-effector targets to defaults")
 
     def _move_keyboard_xy(self, dx: float, dy: float) -> None:
@@ -189,6 +207,7 @@ class KeyboardSOLeader(Teleoperator):
 
     def _move_keyboard_z(self, dz: float) -> None:
         self._state["ee.z"] = self._clamp_state("ee.z", self._state["ee.z"] + dz)
+        self._motion_baseline["ee.z"] = float(self._state["ee.z"])
         logger.info("Keyboard Z -> ee.z=%.3f", self._state["ee.z"])
 
     def _adjust_xy_scale(self, delta_m: float) -> None:
@@ -204,18 +223,37 @@ class KeyboardSOLeader(Teleoperator):
         return self._xy_scale
 
     def _calibrate_top_xy_from_current_hand(self) -> bool:
-        if self._handtracker is None or not hasattr(self._handtracker, "calibrate_top_xy"):
+        """Reset the hand reference points (top cam for XY, side cam for Z) to the current hand."""
+        if self._handtracker is None:
             return False
+        calibrated = False
         try:
-            top = self._handtracker.get_latest_xy().get("top")
-            if top is None:
-                return False
-            self._handtracker.calibrate_top_xy((top.get("mid_x", 0.0), top.get("mid_y", 0.0)))
-            logger.info("Calibrated top XY midpoint from current hand pose")
-            return True
+            latest = self._handtracker.get_latest_xy()
+            top = latest.get("top")
+            if top is not None and hasattr(self._handtracker, "calibrate_top_xy"):
+                self._handtracker.calibrate_top_xy((top.get("mid_x", 0.0), top.get("mid_y", 0.0)))
+                logger.info("Calibrated top XY midpoint from current hand pose")
+                calibrated = True
+            side = latest.get("side")
+            if side is not None and hasattr(self._handtracker, "calibrate_side_z"):
+                self._handtracker.calibrate_side_z((side.get("mid_x", 0.0), side.get("mid_y", 0.0)))
+                logger.info("Calibrated side Z midpoint from current hand pose")
+                calibrated = True
         except Exception:
-            logger.exception("Failed to calibrate top XY midpoint")
-            return False
+            logger.exception("Failed to calibrate hand reference")
+        return calibrated
+
+    def _adjust_z_scale(self, delta_m: float) -> None:
+        if self._handtracker is not None and hasattr(self._handtracker, "adjust_z_scale"):
+            self._z_scale = float(self._handtracker.adjust_z_scale(delta_m))
+        else:
+            self._z_scale = max(0.01, min(0.30, self._z_scale + delta_m))
+        logger.info("Handtracker Z scale -> %.3f m", self._z_scale)
+
+    def _current_z_scale(self) -> float:
+        if self._handtracker is not None and hasattr(self._handtracker, "get_z_scale"):
+            self._z_scale = float(self._handtracker.get_z_scale())
+        return self._z_scale
 
     def _normalize_key_char(self, key) -> str | None:
         char = getattr(key, "char", None)
@@ -252,19 +290,48 @@ class KeyboardSOLeader(Teleoperator):
             logger.exception("Failed to read handtracker relative XY")
             return None
 
+    def _read_relative_z(self) -> float | None:
+        if self._handtracker is None or not hasattr(self._handtracker, "get_latest_xy"):
+            return None
+        try:
+            side = self._handtracker.get_latest_xy().get("side")
+            now = time.monotonic()
+            if side is None:
+                if now - self._last_z_valid_t <= self._xy_hold_timeout_s:
+                    return self._last_relative_z
+                return None
+            self._last_relative_z = float(side.get("dz_norm", 0.0))
+            self._last_z_valid_t = now
+            return self._last_relative_z
+        except Exception:
+            logger.exception("Failed to read handtracker relative Z")
+            return None
+
     def _apply_motion_from_handtracker(self) -> None:
         xy = self._read_relative_xy()
-        if xy is None:
-            return
-        scale = self._current_xy_scale()
-        target_x = self._motion_baseline["ee.x"] + xy["dx_norm"] * scale
-        target_y = self._motion_baseline["ee.y"] + xy["dy_norm"] * scale
-        self._state["ee.x"] = self._clamp_state("ee.x", target_x)
-        self._state["ee.y"] = self._clamp_state("ee.y", target_y)
+        if xy is not None:
+            scale = self._current_xy_scale()
+            target_x = self._motion_baseline["ee.x"] + xy["dx_norm"] * scale
+            target_y = self._motion_baseline["ee.y"] + xy["dy_norm"] * scale
+            self._state["ee.x"] = self._clamp_state("ee.x", target_x)
+            self._state["ee.y"] = self._clamp_state("ee.y", target_y)
+
+        dz_norm = self._read_relative_z()
+        if dz_norm is not None:
+            target_z = self._motion_baseline["ee.z"] + dz_norm * self._current_z_scale()
+            self._state["ee.z"] = self._clamp_state("ee.z", target_z)
+
         now = time.monotonic()
         if now - self._last_hand_log_t >= self._hand_log_interval_s:
             self._last_hand_log_t = now
-            logger.info("Hand XY mapped -> ee.x=%.3f ee.y=%.3f", self._state["ee.x"], self._state["ee.y"])
+            logger.info(
+                "Hand mapped -> ee.x=%.3f ee.y=%.3f ee.z=%.3f (xy %s, z %s)",
+                self._state["ee.x"],
+                self._state["ee.y"],
+                self._state["ee.z"],
+                "live" if xy is not None else "held",
+                "live" if dz_norm is not None else "held",
+            )
 
     def get_action(self) -> dict[str, float]:
         """Return the current end-effector pose."""
@@ -319,6 +386,10 @@ class KeyboardSOLeader(Teleoperator):
                     elif lowered == "e" and self._control_mode == CONTROL_MODE_HANDTRACKER:
                         self._adjust_xy_scale(XY_SCALE_STEP_M)
                         return
+                    elif lowered == "," and self._control_mode == CONTROL_MODE_HANDTRACKER:
+                        self._adjust_z_scale(-Z_SCALE_STEP_M)
+                    elif lowered == "." and self._control_mode == CONTROL_MODE_HANDTRACKER:
+                        self._adjust_z_scale(Z_SCALE_STEP_M)
                     elif lowered == "]" and self._handtracker is not None and hasattr(self._handtracker, "adjust_smoothing"):
                         self._handtracker.adjust_smoothing(0.05)
                     elif lowered == "[" and self._handtracker is not None and hasattr(self._handtracker, "adjust_smoothing"):

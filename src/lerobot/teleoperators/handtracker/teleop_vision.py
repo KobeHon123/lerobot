@@ -34,6 +34,14 @@ if not MODEL_PATH.exists():
 
 ALLOWED_LANDMARKS = {0, 1, 2, 3, 4, 5, 6, 7, 8}
 DEFAULT_XY_SCALE_M = 0.05
+MAX_DELTA_FRAME_FRACTION = 0.25
+DEFAULT_Z_SCALE_M = 0.08
+MIN_Z_SCALE_M = 0.01
+MAX_Z_SCALE_M = 0.30
+MAX_DELTA_HEIGHT_FRACTION = 0.30
+DEADZONE_HEIGHT_FRACTION = 0.0125
+RERUN_IMAGE_EVERY_N = 3
+DEADZONE_FRAME_FRACTION = 0.0125
 MIN_XY_SCALE_M = 0.01
 MAX_XY_SCALE_M = 0.20
 DEFAULT_FRAME_WIDTH = 640
@@ -164,6 +172,7 @@ class HandTrackerService:
         self._timing_sums = {"read": 0.0, "process": 0.0, "rerun": 0.0, "loop": 0.0}
         self._timing_count = 0
         self._timing_last_report = time.monotonic()
+        self._rerun_image_tick = 0
         self._logger = _setup_run_logger()
         self._lock = threading.Lock()
         self._latest_gripper_fraction = 0.0
@@ -183,6 +192,8 @@ class HandTrackerService:
         self._read_failure_limit = 10
         self._read_failure_counts = {"side": 0, "top": 0}
         self._top_xy_mapper = RelativeXYMapper()
+        self._side_z_mapper = RelativeXYMapper()
+        self._z_scale = DEFAULT_Z_SCALE_M
         self._xy_scale = DEFAULT_XY_SCALE_M
 
     def start(self) -> None:
@@ -237,6 +248,36 @@ class HandTrackerService:
         with self._lock:
             self._smoothing_alpha = min(1.0, max(0.05, self._smoothing_alpha + delta))
 
+    def calibrate_side_z(self, midpoint: tuple[float, float] | None) -> None:
+        if midpoint is None:
+            return
+        with self._lock:
+            self._side_z_mapper.reset(midpoint)
+
+    def adjust_z_scale(self, delta_m: float) -> float:
+        with self._lock:
+            self._z_scale = min(MAX_Z_SCALE_M, max(MIN_Z_SCALE_M, self._z_scale + delta_m))
+            return float(self._z_scale)
+
+    def get_z_scale(self) -> float:
+        with self._lock:
+            return float(self._z_scale)
+
+    def _compute_relative_side_z(self, midpoint: tuple[float, float], frame_height: int) -> dict[str, float]:
+        with self._lock:
+            self._side_z_mapper.max_delta_px = MAX_DELTA_HEIGHT_FRACTION * frame_height
+            self._side_z_mapper.deadzone_px = DEADZONE_HEIGHT_FRACTION * frame_height
+            state = self._side_z_mapper.update(midpoint)
+            scale = float(self._z_scale)
+        # Image y points down, so a hand moving up (smaller y) is +z.
+        return {
+            "dz_px": float(-state["dy_px"]),
+            "dz_norm": float(-state["dy_norm"]),
+            "mid_x": float(state["mid_x"]),
+            "mid_y": float(state["mid_y"]),
+            "z_scale": scale,
+        }
+
     def adjust_xy_scale(self, delta_m: float) -> float:
         with self._lock:
             self._xy_scale = min(MAX_XY_SCALE_M, max(MIN_XY_SCALE_M, self._xy_scale + delta_m))
@@ -255,6 +296,17 @@ class HandTrackerService:
                 continue
 
             cap = cv2.VideoCapture(cam_index)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_FRAME_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_FRAME_HEIGHT)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self._logger.info(
+                    "%s camera %s opened at %dx%d",
+                    label,
+                    cam_index,
+                    int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                    int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                )
             if not cap.isOpened():
                 self._logger.warning("%s camera index %s could not be opened; using black frames.", label, cam_index)
                 self._caps[label] = None
@@ -326,8 +378,11 @@ class HandTrackerService:
         self,
         midpoint: tuple[float, float],
         orientation_vector: tuple[float, float] | None,
+        frame_width: int,
     ) -> dict[str, float]:
         with self._lock:
+            self._top_xy_mapper.max_delta_px = MAX_DELTA_FRAME_FRACTION * frame_width
+            self._top_xy_mapper.deadzone_px = DEADZONE_FRAME_FRACTION * frame_width
             state = self._top_xy_mapper.update(midpoint)
             scale = float(self._xy_scale)
 
@@ -401,6 +456,7 @@ class HandTrackerService:
         norm_val_to_show = None
         dist_cm_to_show = None
         top_midpoint = None
+        side_midpoint = None
         top_orientation_vector = None
         top_snapped_orientation = None
 
@@ -446,6 +502,11 @@ class HandTrackerService:
                 if connection.start in ALLOWED_LANDMARKS and connection.end in ALLOWED_LANDMARKS:
                     if connection.start in points and connection.end in points:
                         cv2.line(display_frame, points[connection.start], points[connection.end], (255, 0, 0), 2)
+
+            if label == "side":
+                side_midpoint = self._compute_midpoint(points, 2, 5)
+                if side_midpoint is not None:
+                    cv2.circle(display_frame, (int(side_midpoint[0]), int(side_midpoint[1])), 6, (255, 255, 0), -1)
 
             if label == "top":
                 top_midpoint = self._compute_midpoint(points, 2, 5)
@@ -502,7 +563,7 @@ class HandTrackerService:
         if label == "top":
             rel_xy = None
             if top_midpoint is not None:
-                rel_xy = self._compute_relative_top_xy(top_midpoint, top_orientation_vector)
+                rel_xy = self._compute_relative_top_xy(top_midpoint, top_orientation_vector, width)
             with self._lock:
                 self._latest_xy["top"] = rel_xy
                 scale_now = float(self._xy_scale)
@@ -521,6 +582,24 @@ class HandTrackerService:
             if top_snapped_orientation is not None and top_snapped_orientation[1] is not None:
                 dir_text = f"DIR {top_snapped_orientation[1]:.0f}°"
                 cv2.putText(display_frame, dir_text, (22, 212), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 180, 80), 2)
+
+        if label == "side":
+            rel_z = None
+            if side_midpoint is not None:
+                rel_z = self._compute_relative_side_z(side_midpoint, height)
+            with self._lock:
+                self._latest_xy["side"] = rel_z
+                z_scale_now = float(self._z_scale)
+                z_ref = self._side_z_mapper.reference
+
+            dz_norm_val = float(rel_z.get("dz_norm", 0.0)) if rel_z is not None else 0.0
+            if z_ref is not None:
+                ref_y = int(z_ref[1])
+                cv2.line(display_frame, (0, ref_y), (width - 1, ref_y), (0, 255, 255), 1)
+                cv2.putText(display_frame, "z ref", (width - 90, max(ref_y - 6, 120)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+            cv2.rectangle(display_frame, (15, 108), (380, 190), (0, 0, 0), -1)
+            cv2.putText(display_frame, f"dz {dz_norm_val:+.2f}", (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3)
+            cv2.putText(display_frame, f"Z scale {z_scale_now:.3f} m", (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
 
         cv2.rectangle(display_frame, (0, 0), (width, 100), (0, 0, 0), -1)
         cv2.putText(display_frame, status_text, (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 2)
@@ -566,6 +645,33 @@ class HandTrackerService:
             sums["loop"] / n * 1000,
             n / (now - self._timing_last_report),
         )
+        top_state = self.get_latest_xy().get("top")
+        with self._lock:
+            top_shape = self._latest_frames["top"].shape
+        reference = self._top_xy_mapper.reference
+        if isinstance(top_state, dict):
+            self._logger.info(
+                "Top XY: frame=%dx%d max_delta_px=%.0f ref=%s mid=(%.0f,%.0f) dx_px=%.1f dy_px=%.1f dx_norm=%+.2f dy_norm=%+.2f",
+                top_shape[1],
+                top_shape[0],
+                self._top_xy_mapper.max_delta_px,
+                None if reference is None else f"({reference[0]:.0f},{reference[1]:.0f})",
+                top_state.get("mid_x", 0.0),
+                top_state.get("mid_y", 0.0),
+                top_state.get("dx_px", 0.0),
+                top_state.get("dy_px", 0.0),
+                top_state.get("dx_norm", 0.0),
+                top_state.get("dy_norm", 0.0),
+            )
+        else:
+            self._logger.info("Top XY: frame=%dx%d hand NOT detected", top_shape[1], top_shape[0])
+        side_state = self.get_latest_xy().get("side")
+        if isinstance(side_state, dict):
+            self._logger.info(
+                "Side Z: dz_px=%.1f dz_norm=%+.2f z_scale=%.3f", side_state.get("dz_px", 0.0), side_state.get("dz_norm", 0.0), side_state.get("z_scale", 0.0)
+            )
+        else:
+            self._logger.info("Side Z: hand NOT detected")
         for key in sums:
             sums[key] = 0.0
         self._timing_count = 0
@@ -583,7 +689,13 @@ class HandTrackerService:
         dx_norm = float(top_state.get("dx_norm", 0.0)) if detected else 0.0
         dy_norm = float(top_state.get("dy_norm", 0.0)) if detected else 0.0
         scale = self.get_xy_scale()
+        side_state = self.get_latest_xy().get("side")
+        side_detected = isinstance(side_state, dict)
+        dz_norm = float(side_state.get("dz_norm", 0.0)) if side_detected else 0.0
+        z_scale = self.get_z_scale()
 
+        rr.log("hand_tracker/dz_norm", rr.Scalars(dz_norm))
+        rr.log("hand_tracker/z_scale", rr.Scalars(z_scale))
         rr.log("hand_tracker/dx_norm", rr.Scalars(dx_norm))
         rr.log("hand_tracker/dy_norm", rr.Scalars(dy_norm))
         rr.log("hand_tracker/xy_scale", rr.Scalars(scale))
@@ -592,14 +704,16 @@ class HandTrackerService:
             "hand_tracker/status",
             rr.TextDocument(
                 f"hand {'detected' if detected else 'NOT detected'}\n\n"
-                f"dx_norm = {dx_norm:+.3f}\n\ndy_norm = {dy_norm:+.3f}\n\nxy_scale = {scale:.3f} m"
+                f"dx_norm = {dx_norm:+.3f}\n\ndy_norm = {dy_norm:+.3f}\n\nxy_scale = {scale:.3f} m\n\n"
+                f"side hand {'detected' if side_detected else 'NOT detected'}: dz_norm = {dz_norm:+.3f}\n\nz_scale = {z_scale:.3f} m"
             ),
         )
 
-        if _RERUN_LOGGING_MODE == "full":
+        self._rerun_image_tick += 1
+        if _RERUN_LOGGING_MODE == "full" and self._rerun_image_tick % RERUN_IMAGE_EVERY_N == 0:
             try:
-                rr.log("hand_tracker/side", rr.Image(side_frame))
-                rr.log("hand_tracker/top", rr.Image(top_frame))
+                rr.log("hand_tracker/side", rr.Image(side_frame).compress(jpeg_quality=70))
+                rr.log("hand_tracker/top", rr.Image(top_frame).compress(jpeg_quality=70))
                 rr.log("hand_tracker/gripper_fraction", rr.Scalars(self.get_gripper_fraction()))
             except Exception as e:
                 self._logger.warning("Rerun image/gripper log failed: %s", e)
@@ -738,6 +852,23 @@ def calibrate_top_xy(midpoint: tuple[float, float] | None) -> None:
 def adjust_smoothing(delta: float) -> None:
     if _default_service is not None:
         _default_service.adjust_smoothing(delta)
+
+
+def calibrate_side_z(midpoint: tuple[float, float] | None) -> None:
+    if _default_service is not None and midpoint is not None:
+        _default_service.calibrate_side_z(midpoint)
+
+
+def adjust_z_scale(delta_m: float) -> float:
+    if _default_service is not None:
+        return _default_service.adjust_z_scale(delta_m)
+    return DEFAULT_Z_SCALE_M
+
+
+def get_z_scale() -> float:
+    if _default_service is not None:
+        return _default_service.get_z_scale()
+    return DEFAULT_Z_SCALE_M
 
 
 def adjust_xy_scale(delta_m: float) -> float:
