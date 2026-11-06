@@ -33,9 +33,9 @@ if not MODEL_PATH.exists():
     )
 
 ALLOWED_LANDMARKS = {0, 1, 2, 3, 4, 5, 6, 7, 8}
-DEFAULT_XY_SCALE_M = 0.05
+DEFAULT_XY_SCALE_M = 0.15
 MAX_DELTA_FRAME_FRACTION = 0.25
-DEFAULT_Z_SCALE_M = 0.08
+DEFAULT_Z_SCALE_M = 0.15
 MIN_Z_SCALE_M = 0.01
 MAX_Z_SCALE_M = 0.30
 MAX_DELTA_HEIGHT_FRACTION = 0.30
@@ -356,94 +356,53 @@ class HandTrackerService:
             return (x1 + x2) / 2, (y1 + y2) / 2
         return None
 
-    def _snap_orientation_to_180(self, orientation_vector: tuple[float, float] | None) -> tuple[tuple[float, float], float] | None:
-        if orientation_vector is None:
-            return None
-
-        vx, vy = orientation_vector
-        norm = math.hypot(vx, vy)
-        if norm < 1e-6:
-            return None
-
-        # Convert from image coordinates (y down) into a user/cartesian frame
-        # where +Y is upward and 0 degrees means pointing upward.
-        user_x = vx / norm
-        user_y = -vy / norm
-        angle_deg = (math.degrees(math.atan2(user_x, user_y)) + 360.0) % 360.0
-        snapped_deg = (round(angle_deg / 180.0) * 180.0) % 360.0
-        snapped_rad = math.radians(snapped_deg)
-
-        snapped_user_x = math.sin(snapped_rad)
-        snapped_user_y = math.cos(snapped_rad)
-
-        # Return back in image coordinates for display (y down).
-        snapped_img_x = float(snapped_user_x)
-        snapped_img_y = float(-snapped_user_y)
-        return (snapped_img_x, snapped_img_y), snapped_deg
-
-    def _compute_relative_top_xy(
+    def _compute_side_hand_elevation(
         self,
-        midpoint: tuple[float, float],
-        orientation_vector: tuple[float, float] | None,
-        frame_width: int,
-    ) -> dict[str, float]:
+        points: dict[int, tuple[int, int]],
+        hand_world_landmarks: Any,
+    ) -> tuple[float | None, float | None]:
+        """Compute hand elevation angle from wrist(0) -> index MCP(5).
+
+        Returns:
+            (pitch_2d_deg, pitch_3d_deg)
+            - 2D image-plane estimate: atan2(-dy_px, |dx_px|)
+            - 3D world-landmark estimate: atan2(-vy, hypot(vx, vz))
+        """
+        pitch_2d_deg: float | None = None
+        pitch_3d_deg: float | None = None
+
+        if 0 in points and 5 in points:
+            x0, y0 = points[0]
+            x5, y5 = points[5]
+            dx_px = float(x5 - x0)
+            dy_px = float(y5 - y0)
+            pitch_2d_deg = math.degrees(math.atan2(-dy_px, abs(dx_px)))
+
+        try:
+            w0 = hand_world_landmarks[0]
+            w5 = hand_world_landmarks[5]
+            vx = float(w5.x - w0.x)
+            vy = float(w5.y - w0.y)
+            vz = float(w5.z - w0.z)
+            pitch_3d_deg = math.degrees(math.atan2(-vy, math.hypot(vx, vz)))
+        except Exception:
+            pitch_3d_deg = None
+
+        return pitch_2d_deg, pitch_3d_deg
+
+    def _compute_relative_top_xy(self, midpoint: tuple[float, float], frame_width: int) -> dict[str, float]:
         with self._lock:
             self._top_xy_mapper.max_delta_px = MAX_DELTA_FRAME_FRACTION * frame_width
             self._top_xy_mapper.deadzone_px = DEADZONE_FRAME_FRACTION * frame_width
             state = self._top_xy_mapper.update(midpoint)
             scale = float(self._xy_scale)
 
-        snapped_orientation = self._snap_orientation_to_180(orientation_vector)
-
-        # Auto-orient axes so +Y follows wrist->finger direction.
-        # Fallback to camera axes when orientation is unavailable.
-        if snapped_orientation is None:
-            ux_x, ux_y = 1.0, 0.0
-            uy_x, uy_y = 0.0, 1.0
-            snapped_deg = None
-        else:
-            _, snapped_deg = snapped_orientation
-            snapped_rad = math.radians(snapped_deg)
-            # User frame: +Y is the hand's wrist->finger direction, +X is the
-            # clockwise perpendicular so left/right remain intuitive on the
-            # overhead view.
-            uy_x, uy_y = math.sin(snapped_rad), math.cos(snapped_rad)
-            ux_x, ux_y = math.cos(snapped_rad), -math.sin(snapped_rad)
-
-        raw_dx = float(state.get("dx_px", 0.0))
-        raw_dy = float(state.get("dy_px", 0.0))
-
-        # Convert raw image-space deltas into the user/cartesian frame.
-        raw_user_dx = raw_dx
-        raw_user_dy = -raw_dy
-
-        aligned_x_px = raw_user_dx * ux_x + raw_user_dy * ux_y
-        aligned_y_px = raw_user_dx * uy_x + raw_user_dy * uy_y
-
-        max_delta = float(self._top_xy_mapper.max_delta_px)
-        deadzone = float(self._top_xy_mapper.deadzone_px)
-
-        if abs(aligned_x_px) < deadzone:
-            aligned_x_px = 0.0
-        if abs(aligned_y_px) < deadzone:
-            aligned_y_px = 0.0
-
-        aligned_x_px = max(-max_delta, min(max_delta, aligned_x_px))
-        aligned_y_px = max(-max_delta, min(max_delta, aligned_y_px))
-
-        dx_norm = aligned_x_px / max_delta if max_delta > 0 else 0.0
-        dy_norm = aligned_y_px / max_delta if max_delta > 0 else 0.0
-
-        dx_norm = max(-1.0, min(1.0, dx_norm))
-        dy_norm = max(-1.0, min(1.0, dy_norm))
-
-        state["dx_px"] = float(aligned_x_px)
-        state["dy_px"] = float(aligned_y_px)
-        state["dx_norm"] = float(dx_norm)
-        state["dy_norm"] = float(dy_norm)
+        # Fixed camera axes, independent of hand orientation: +X is image right and
+        # +Y is image up (image y points down, so it is negated). The mapper already
+        # applied the deadzone and clamped to the max delta.
+        state["dy_px"] = float(-state["dy_px"])
+        state["dy_norm"] = float(-state["dy_norm"])
         state["xy_scale"] = float(scale)
-        if snapped_deg is not None:
-            state["orientation_deg"] = float(snapped_deg)
         return state
 
     def _process_frame(self, frame: np.ndarray, landmarker: hand_landmarker.HandLandmarker, label: str) -> tuple[np.ndarray, float | None]:
@@ -464,8 +423,8 @@ class HandTrackerService:
         dist_cm_to_show = None
         top_midpoint = None
         side_midpoint = None
-        top_orientation_vector = None
-        top_snapped_orientation = None
+        side_pitch_2d_deg: float | None = None
+        side_pitch_3d_deg: float | None = None
 
         def _draw_top_xy_axes() -> None:
             if label != "top":
@@ -480,12 +439,9 @@ class HandTrackerService:
             origin_x, origin_y = int(origin[0]), int(origin[1])
             axis_len = max(40, min(width, height) // 5)
 
-            if top_snapped_orientation is None:
-                y_axis = (0.0, -1.0)
-            else:
-                y_axis = top_snapped_orientation[0]
-
-            x_axis = (float(y_axis[1]), float(-y_axis[0]))
+            # Fixed axes: +X to the image right, +Y to the image up.
+            x_axis = (1.0, 0.0)
+            y_axis = (0.0, -1.0)
             x_end = (int(origin_x + x_axis[0] * axis_len), int(origin_y + x_axis[1] * axis_len))
             y_end = (int(origin_x + y_axis[0] * axis_len), int(origin_y + y_axis[1] * axis_len))
 
@@ -514,27 +470,12 @@ class HandTrackerService:
                 side_midpoint = self._compute_midpoint(points, 2, 5)
                 if side_midpoint is not None:
                     cv2.circle(display_frame, (int(side_midpoint[0]), int(side_midpoint[1])), 6, (255, 255, 0), -1)
+                side_pitch_2d_deg, side_pitch_3d_deg = self._compute_side_hand_elevation(points, hand_world_landmarks)
 
             if label == "top":
                 top_midpoint = self._compute_midpoint(points, 2, 5)
                 if top_midpoint is not None:
                     cv2.circle(display_frame, (int(top_midpoint[0]), int(top_midpoint[1])), 6, (255, 255, 0), -1)
-
-                wrist = points.get(0)
-                finger_root = points.get(5)
-                if wrist is not None and finger_root is not None:
-                    top_orientation_vector = (float(finger_root[0] - wrist[0]), float(finger_root[1] - wrist[1]))
-                    top_snapped_orientation = self._snap_orientation_to_180(top_orientation_vector)
-                    arrow_vector = top_orientation_vector
-                    if top_snapped_orientation is not None:
-                        arrow_vector = top_snapped_orientation[0]
-
-                    arrow_len = max(30, min(width, height) // 6)
-                    arrow_end = (
-                        int(wrist[0] + arrow_vector[0] * arrow_len),
-                        int(wrist[1] + arrow_vector[1] * arrow_len),
-                    )
-                    cv2.arrowedLine(display_frame, (int(wrist[0]), int(wrist[1])), arrow_end, (0, 200, 255), 2, tipLength=0.2)
 
                 _draw_top_xy_axes()
 
@@ -570,7 +511,7 @@ class HandTrackerService:
         if label == "top":
             rel_xy = None
             if top_midpoint is not None:
-                rel_xy = self._compute_relative_top_xy(top_midpoint, top_orientation_vector, width)
+                rel_xy = self._compute_relative_top_xy(top_midpoint, width)
             with self._lock:
                 self._latest_xy["top"] = rel_xy
                 scale_now = float(self._xy_scale)
@@ -578,22 +519,18 @@ class HandTrackerService:
             dx_norm_val = float(rel_xy.get("dx_norm", 0.0)) if rel_xy is not None else 0.0
             dy_norm_val = float(rel_xy.get("dy_norm", 0.0)) if rel_xy is not None else 0.0
 
-            if top_snapped_orientation is not None and top_snapped_orientation[1] is not None:
-                status_text += f"   Dir: {top_snapped_orientation[1]:.0f}°"
-
             scale_text = f"XY scale {scale_now:.3f} m"
             norms_text = f"dx {dx_norm_val:.2f}  dy {dy_norm_val:.2f}"
-            cv2.rectangle(display_frame, (15, 108), (380, 225), (0, 0, 0), -1)
+            cv2.rectangle(display_frame, (15, 108), (380, 190), (0, 0, 0), -1)
             cv2.putText(display_frame, norms_text, (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3)
             cv2.putText(display_frame, scale_text, (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
-            if top_snapped_orientation is not None and top_snapped_orientation[1] is not None:
-                dir_text = f"DIR {top_snapped_orientation[1]:.0f}°"
-                cv2.putText(display_frame, dir_text, (22, 212), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 180, 80), 2)
 
         if label == "side":
             rel_z = None
             if side_midpoint is not None:
                 rel_z = self._compute_relative_side_z(side_midpoint, height)
+                rel_z["pitch_2d_deg"] = side_pitch_2d_deg
+                rel_z["pitch_3d_deg"] = side_pitch_3d_deg
             with self._lock:
                 self._latest_xy["side"] = rel_z
                 z_scale_now = float(self._z_scale)
@@ -604,9 +541,20 @@ class HandTrackerService:
                 ref_y = int(z_ref[1])
                 cv2.line(display_frame, (0, ref_y), (width - 1, ref_y), (0, 255, 255), 1)
                 cv2.putText(display_frame, "z ref", (width - 90, max(ref_y - 6, 120)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-            cv2.rectangle(display_frame, (15, 108), (380, 190), (0, 0, 0), -1)
+            cv2.rectangle(display_frame, (15, 108), (565, 230), (0, 0, 0), -1)
             cv2.putText(display_frame, f"dz {dz_norm_val:+.2f}", (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3)
             cv2.putText(display_frame, f"Z scale {z_scale_now:.3f} m", (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
+            pitch2d_text = "--" if side_pitch_2d_deg is None else f"{side_pitch_2d_deg:+.1f}"
+            pitch3d_text = "--" if side_pitch_3d_deg is None else f"{side_pitch_3d_deg:+.1f}"
+            cv2.putText(
+                display_frame,
+                f"pitch2d {pitch2d_text} deg   pitch3d {pitch3d_text} deg",
+                (22, 218),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (200, 220, 255),
+                2,
+            )
 
         cv2.rectangle(display_frame, (0, 0), (width, 100), (0, 0, 0), -1)
         cv2.putText(display_frame, status_text, (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 2)
@@ -675,7 +623,16 @@ class HandTrackerService:
         side_state = self.get_latest_xy().get("side")
         if isinstance(side_state, dict):
             self._logger.info(
-                "Side Z: dz_px=%.1f dz_norm=%+.2f z_scale=%.3f", side_state.get("dz_px", 0.0), side_state.get("dz_norm", 0.0), side_state.get("z_scale", 0.0)
+                "Side Z: dz_px=%.1f dz_norm=%+.2f z_scale=%.3f pitch2d=%s pitch3d=%s",
+                side_state.get("dz_px", 0.0),
+                side_state.get("dz_norm", 0.0),
+                side_state.get("z_scale", 0.0),
+                "--"
+                if side_state.get("pitch_2d_deg") is None
+                else f"{float(side_state.get('pitch_2d_deg', 0.0)):+.2f}",
+                "--"
+                if side_state.get("pitch_3d_deg") is None
+                else f"{float(side_state.get('pitch_3d_deg', 0.0)):+.2f}",
             )
         else:
             self._logger.info("Side Z: hand NOT detected")
@@ -699,10 +656,18 @@ class HandTrackerService:
         side_state = self.get_latest_xy().get("side")
         side_detected = isinstance(side_state, dict)
         dz_norm = float(side_state.get("dz_norm", 0.0)) if side_detected else 0.0
+        pitch_2d_deg = float(side_state.get("pitch_2d_deg", 0.0)) if side_detected and side_state.get("pitch_2d_deg") is not None else 0.0
+        pitch_3d_deg = float(side_state.get("pitch_3d_deg", 0.0)) if side_detected and side_state.get("pitch_3d_deg") is not None else 0.0
+        pitch_2d_valid = 1.0 if side_detected and side_state.get("pitch_2d_deg") is not None else 0.0
+        pitch_3d_valid = 1.0 if side_detected and side_state.get("pitch_3d_deg") is not None else 0.0
         z_scale = self.get_z_scale()
 
         rr.log("hand_tracker/dz_norm", rr.Scalars(dz_norm))
         rr.log("hand_tracker/z_scale", rr.Scalars(z_scale))
+        rr.log("hand_tracker/pitch_2d_deg", rr.Scalars(pitch_2d_deg))
+        rr.log("hand_tracker/pitch_3d_deg", rr.Scalars(pitch_3d_deg))
+        rr.log("hand_tracker/pitch_2d_valid", rr.Scalars(pitch_2d_valid))
+        rr.log("hand_tracker/pitch_3d_valid", rr.Scalars(pitch_3d_valid))
         rr.log("hand_tracker/dx_norm", rr.Scalars(dx_norm))
         rr.log("hand_tracker/dy_norm", rr.Scalars(dy_norm))
         rr.log("hand_tracker/xy_scale", rr.Scalars(scale))
@@ -712,7 +677,10 @@ class HandTrackerService:
             rr.TextDocument(
                 f"hand {'detected' if detected else 'NOT detected'}\n\n"
                 f"dx_norm = {dx_norm:+.3f}\n\ndy_norm = {dy_norm:+.3f}\n\nxy_scale = {scale:.3f} m\n\n"
-                f"side hand {'detected' if side_detected else 'NOT detected'}: dz_norm = {dz_norm:+.3f}\n\nz_scale = {z_scale:.3f} m"
+                f"side hand {'detected' if side_detected else 'NOT detected'}: dz_norm = {dz_norm:+.3f}\n\n"
+                f"pitch2d = {pitch_2d_deg:+.2f} deg ({'ok' if pitch_2d_valid > 0 else 'n/a'})\n\n"
+                f"pitch3d = {pitch_3d_deg:+.2f} deg ({'ok' if pitch_3d_valid > 0 else 'n/a'})\n\n"
+                f"z_scale = {z_scale:.3f} m"
             ),
         )
 

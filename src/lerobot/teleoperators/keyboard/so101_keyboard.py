@@ -12,20 +12,25 @@ In both modes, `1` = keyboard mode, `2` = lightweight handtracker logging,
 `3` = full handtracker video logging, and `q` / `e` tune the active handtracker
 motion scale while in handtracker mode.
 
-In handtracker modes (`2` / `3`), `4` toggles the XY mapping and `5` toggles the Z
-mapping. A disabled axis group keeps its last position. Re-enabling re-bases the
-hand origin to the current hand position, so the arm does not jump.
+In handtracker modes (`2` / `3`), `4` toggles the XY mapping, `5` toggles the Z
+mapping, and `6` cycles pitch mapping: 2D elevation -> 3D elevation -> off.
+A disabled axis group keeps its last position. Re-enabling re-bases the hand
+reference to the current hand pose, so the arm does not jump.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from lerobot.utils.import_utils import _pynput_available, require_package
+import numpy as np
+
+from lerobot.utils.import_utils import require_package
+from lerobot.utils.rotation import Rotation
 from ..teleoperator import Teleoperator
 from ..config import TeleoperatorConfig
 
@@ -46,6 +51,17 @@ EE_Z_MIN_M = 0.02
 EE_Z_MAX_M = 0.40
 Z_SCALE_STEP_M = 0.01
 LOCKED_ORIENTATION = {"ee.wx": 0.0, "ee.wy": 0.0, "ee.wz": 0.0}
+PITCH_MODE_OFF = "off"
+PITCH_MODE_2D = "2d"
+PITCH_MODE_3D = "3d"
+PITCH_DEADZONE_DEG = 2.0
+PITCH_CLAMP_DEG = 40.0
+PITCH_EMA_ALPHA = 0.25
+PITCH_RATE_LIMIT_DEG_PER_S = 60.0
+PITCH_GAIN_DEFAULT = 1.0
+PITCH_DOWN_MIN_DEG = 0.0
+PITCH_DOWN_MAX_DEG = 90.0
+PITCH_DOWN_DEFAULT_DEG = 45.0
 
 
 @TeleoperatorConfig.register_subclass("keyboard_so_leader")
@@ -56,6 +72,10 @@ class KeyboardSOLeaderConfig(TeleoperatorConfig):
     step_deg: float = 1.0
     use_degrees: bool = True
     handtracker_module: str | None = None
+    # Extra roll applied to the seeded start orientation, about the tool (gripper) axis.
+    # The sim follower starts with its wrist 90 deg anticlockwise from upright; +90
+    # (clockwise, looking along the gripper) puts the wrist camera upright again.
+    wrist_roll_offset_deg: float = 90.0
 
 
 class KeyboardSOLeader(Teleoperator):
@@ -80,7 +100,7 @@ class KeyboardSOLeader(Teleoperator):
         self._listener = None
         self._control_mode: str = CONTROL_MODE_KEYBOARD
         self._motion_baseline: dict[str, float] = {"ee.x": 0.0, "ee.y": 0.0, "ee.z": 0.15}
-        self._xy_scale: float = 0.05
+        self._xy_scale: float = 0.15
         self._keyboard_step: float = self.config.step_deg * 0.01
         self._last_relative_xy: dict[str, float] = {"dx_px": 0.0, "dy_px": 0.0, "dx_norm": 0.0, "dy_norm": 0.0}
         self._last_xy_valid_t: float = 0.0
@@ -90,12 +110,24 @@ class KeyboardSOLeader(Teleoperator):
         self._xy_rebase_pending: bool = False
         self._z_rebase_pending: bool = False
         self._last_z_valid_t: float = 0.0
-        self._z_scale: float = 0.08
+        self._z_scale: float = 0.15
         self._xy_hold_timeout_s: float = 0.35
         self._last_hand_log_t: float = 0.0
         self._hand_log_interval_s: float = 0.5
         self._orientation_lock = dict(LOCKED_ORIENTATION)
         self._apply_orientation_lock()
+        self._pitch_mapping_mode: str = PITCH_MODE_OFF
+        self._pitch_rebase_pending: bool = False
+        self._pitch_gain: float = PITCH_GAIN_DEFAULT
+        self._pitch_down_cmd_deg: float = PITCH_DOWN_DEFAULT_DEG
+        self._pitch_down_baseline_deg: float = self._pitch_down_cmd_deg
+        self._pitch_elevation_ref_deg: float | None = None
+        self._last_pitch_delta_ema_deg: float = 0.0
+        self._last_pitch_valid_t: float = 0.0
+        self._last_pitch_measurement_deg: float = 0.0
+        self._pitch_hold_timeout_s: float = self._xy_hold_timeout_s
+        self._last_pitch_cmd_update_t: float = time.monotonic()
+        self._last_env_yaw_rad: float = 0.0
 
         # Optional handtracker integration
         self._handtracker = None
@@ -164,8 +196,46 @@ class KeyboardSOLeader(Teleoperator):
             }
             self._xy_rebase_pending = True
             self._z_rebase_pending = True
+            self._pitch_mapping_mode = PITCH_MODE_2D
+            self._pitch_rebase_pending = True
+            self._pitch_down_baseline_deg = float(self._pitch_down_cmd_deg)
         self._control_mode = mode
         logger.info("Control mode switched to: %s", self._control_mode)
+
+    @staticmethod
+    def _rot_z(theta_rad: float) -> np.ndarray:
+        c = math.cos(theta_rad)
+        s = math.sin(theta_rad)
+        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+
+    @staticmethod
+    def _rot_y(theta_rad: float) -> np.ndarray:
+        c = math.cos(theta_rad)
+        s = math.sin(theta_rad)
+        return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=float)
+
+    def _compose_orientation(self, yaw_rad: float, pitch_down_deg: float, local_roll_deg: float = 0.0) -> dict[str, float]:
+        # R_target = Rz(yaw) * Ry(90deg + pitch_down) * Rz_local(roll)
+        r_target = (
+            self._rot_z(yaw_rad)
+            @ self._rot_y(math.radians(90.0 + float(pitch_down_deg)))
+            @ self._rot_z(math.radians(float(local_roll_deg)))
+        )
+        rotvec = Rotation.from_matrix(r_target).as_rotvec()
+        return {"ee.wx": float(rotvec[0]), "ee.wy": float(rotvec[1]), "ee.wz": float(rotvec[2])}
+
+    def _compute_env_yaw_rad(self) -> float:
+        # User frame -> env frame mapping (same transform as run_sim_keyboard adapter)
+        # env_x = user_y, env_y = -user_x
+        user_x = float(self._state["ee.x"])
+        user_y = float(self._state["ee.y"])
+        env_x = user_y
+        env_y = -user_x
+        if abs(env_x) < 1e-6 and abs(env_y) < 1e-6:
+            return self._last_env_yaw_rad
+        yaw = math.atan2(env_y, env_x)
+        self._last_env_yaw_rad = yaw
+        return yaw
 
     def seed_initial_pose(self, pose: dict[str, float]) -> None:
         aliases = {
@@ -194,13 +264,24 @@ class KeyboardSOLeader(Teleoperator):
             "ee.y": float(self._state["ee.y"]),
             "ee.z": float(self._state["ee.z"]),
         }
-        self._orientation_lock = {
-            "ee.wx": float(self._state["ee.wx"]),
-            "ee.wy": float(self._state["ee.wy"]),
-            "ee.wz": float(self._state["ee.wz"]),
-        }
+        self._orientation_lock = self._rolled_orientation(
+            (float(self._state["ee.wx"]), float(self._state["ee.wy"]), float(self._state["ee.wz"])),
+            self.config.wrist_roll_offset_deg,
+        )
         self._apply_orientation_lock()
         logger.info("Seeded initial EE pose: %s", {k: self._state[k] for k in self.motors})
+
+    @staticmethod
+    def _rolled_orientation(rotvec: tuple[float, float, float], roll_deg: float) -> dict[str, float]:
+        """Rotate a world-frame orientation (rotation vector) about its own tool z axis."""
+        if roll_deg == 0.0:
+            wx, wy, wz = rotvec
+        else:
+            rolled = Rotation.from_rotvec(np.asarray(rotvec)) * Rotation.from_rotvec(
+                np.array([0.0, 0.0, math.radians(roll_deg)])
+            )
+            wx, wy, wz = (float(v) for v in rolled.as_rotvec())
+        return {"ee.wx": wx, "ee.wy": wy, "ee.wz": wz}
 
     def _reset_pose(self) -> None:
         self._state = {key: 0.0 for key in self.motors}
@@ -299,77 +380,71 @@ class KeyboardSOLeader(Teleoperator):
             " - waiting for hand to re-base origin" if enabled else "",
         )
 
-    def _adjust_z_scale(self, delta_m: float) -> None:
-        if self._handtracker is not None and hasattr(self._handtracker, "adjust_z_scale"):
-            self._z_scale = float(self._handtracker.adjust_z_scale(delta_m))
+    def _set_pitch_mapping_mode(self, mode: str) -> None:
+        if self._control_mode != CONTROL_MODE_HANDTRACKER:
+            logger.info("Pitch mapping toggle ignored: only available in handtracker modes (2 / 3)")
+            return
+        if mode not in {PITCH_MODE_OFF, PITCH_MODE_2D, PITCH_MODE_3D}:
+            return
+        self._pitch_mapping_mode = mode
+        if mode == PITCH_MODE_OFF:
+            self._pitch_rebase_pending = False
+            logger.info("Pitch mapping DISABLED (holding last pitch %.1f deg)", self._pitch_down_cmd_deg)
+            return
+        self._pitch_rebase_pending = True
+        self._pitch_down_baseline_deg = float(self._pitch_down_cmd_deg)
+        logger.info("Pitch mapping -> %s (waiting for hand to re-base reference)", mode.upper())
+
+    def _toggle_pitch_mapping_mode(self) -> None:
+        if self._pitch_mapping_mode == PITCH_MODE_2D:
+            self._set_pitch_mapping_mode(PITCH_MODE_3D)
+        elif self._pitch_mapping_mode == PITCH_MODE_3D:
+            self._set_pitch_mapping_mode(PITCH_MODE_OFF)
         else:
-            self._z_scale = max(0.01, min(0.30, self._z_scale + delta_m))
-        logger.info("Handtracker Z scale -> %.3f m", self._z_scale)
+            self._set_pitch_mapping_mode(PITCH_MODE_2D)
 
-    def _current_z_scale(self) -> float:
-        if self._handtracker is not None and hasattr(self._handtracker, "get_z_scale"):
-            self._z_scale = float(self._handtracker.get_z_scale())
-        return self._z_scale
-
-    def _normalize_key_char(self, key) -> str | None:
-        char = getattr(key, "char", None)
-        if char is not None:
-            return str(char)
-
-        key_str = str(key)
-        match = re.search(r"char='(.+)'", key_str)
-        if match is not None:
-            return match.group(1)
-
-        return None
-
-    def _read_relative_xy(self) -> dict[str, float] | None:
+    def _read_pitch_elevation_deg(self) -> float | None:
         if self._handtracker is None or not hasattr(self._handtracker, "get_latest_xy"):
             return None
-        try:
-            latest_xy = self._handtracker.get_latest_xy()
-            top = latest_xy.get("top") if isinstance(latest_xy, dict) else None
-            if top is None:
-                now = time.monotonic()
-                if now - self._last_xy_valid_t <= self._xy_hold_timeout_s:
-                    return self._last_relative_xy
-                return None
-            self._last_relative_xy = {
-                "dx_px": float(top.get("dx_px", 0.0)),
-                "dy_px": float(top.get("dy_px", 0.0)),
-                "dx_norm": float(top.get("dx_norm", 0.0)),
-                "dy_norm": float(top.get("dy_norm", 0.0)),
-            }
-            self._last_xy_valid_t = time.monotonic()
-            return self._last_relative_xy
-        except Exception:
-            logger.exception("Failed to read handtracker relative XY")
+        if self._pitch_mapping_mode not in {PITCH_MODE_2D, PITCH_MODE_3D}:
             return None
-
-    @staticmethod
-    def _mapping_status(live: bool, enabled: bool, rebase_pending: bool) -> str:
-        if not enabled:
-            return "disabled"
-        if rebase_pending:
-            return "waiting for hand"
-        return "live" if live else "held"
-
-    def _read_relative_z(self) -> float | None:
-        if self._handtracker is None or not hasattr(self._handtracker, "get_latest_xy"):
-            return None
+        key = "pitch_2d_deg" if self._pitch_mapping_mode == PITCH_MODE_2D else "pitch_3d_deg"
         try:
             side = self._handtracker.get_latest_xy().get("side")
             now = time.monotonic()
-            if side is None:
-                if now - self._last_z_valid_t <= self._xy_hold_timeout_s:
-                    return self._last_relative_z
+            if side is None or side.get(key) is None:
+                if now - self._last_pitch_valid_t <= self._pitch_hold_timeout_s:
+                    return self._last_pitch_measurement_deg
                 return None
-            self._last_relative_z = float(side.get("dz_norm", 0.0))
-            self._last_z_valid_t = now
-            return self._last_relative_z
+            value = float(side.get(key, 0.0))
+            self._last_pitch_measurement_deg = value
+            self._last_pitch_valid_t = now
+            return value
         except Exception:
-            logger.exception("Failed to read handtracker relative Z")
+            logger.exception("Failed to read handtracker pitch elevation")
             return None
+
+    def _try_rebase_pitch(self) -> bool:
+        elevation = self._read_pitch_elevation_deg()
+        if elevation is None:
+            return False
+        self._pitch_elevation_ref_deg = float(elevation)
+        self._pitch_down_baseline_deg = float(self._pitch_down_cmd_deg)
+        self._last_pitch_delta_ema_deg = 0.0
+        self._pitch_rebase_pending = False
+        return True
+
+    @staticmethod
+    def _apply_deadzone(value: float, deadzone: float) -> float:
+        if abs(value) <= deadzone:
+            return 0.0
+        return math.copysign(abs(value) - deadzone, value)
+
+    def _update_handtracker_orientation(self) -> None:
+        yaw = self._compute_env_yaw_rad()
+        orientation = self._compose_orientation(yaw, self._pitch_down_cmd_deg, local_roll_deg=0.0)
+        self._orientation_lock = orientation
+        self._apply_orientation_lock()
 
     def _apply_motion_from_handtracker(self) -> None:
         xy = None
@@ -397,16 +472,52 @@ class KeyboardSOLeader(Teleoperator):
             target_z = self._motion_baseline["ee.z"] + dz_norm * self._current_z_scale()
             self._state["ee.z"] = self._clamp_state("ee.z", target_z)
 
+        pitch_live = False
+        if self._pitch_mapping_mode != PITCH_MODE_OFF:
+            if self._pitch_rebase_pending:
+                if self._try_rebase_pitch():
+                    logger.info(
+                        "Pitch reference re-based at %.2f deg (pitch_down=%.1f deg)",
+                        float(self._pitch_elevation_ref_deg or 0.0),
+                        self._pitch_down_cmd_deg,
+                    )
+            else:
+                elevation = self._read_pitch_elevation_deg()
+                if elevation is not None and self._pitch_elevation_ref_deg is not None:
+                    hand_delta = float(elevation - self._pitch_elevation_ref_deg)
+                    hand_delta = self._apply_deadzone(hand_delta, PITCH_DEADZONE_DEG)
+                    hand_delta = max(-PITCH_CLAMP_DEG, min(PITCH_CLAMP_DEG, hand_delta))
+                    self._last_pitch_delta_ema_deg = (
+                        PITCH_EMA_ALPHA * hand_delta + (1.0 - PITCH_EMA_ALPHA) * self._last_pitch_delta_ema_deg
+                    )
+                    pitch_target = self._pitch_down_baseline_deg - self._pitch_gain * self._last_pitch_delta_ema_deg
+                    pitch_target = max(PITCH_DOWN_MIN_DEG, min(PITCH_DOWN_MAX_DEG, pitch_target))
+
+                    now = time.monotonic()
+                    dt = max(1e-3, now - self._last_pitch_cmd_update_t)
+                    max_step = PITCH_RATE_LIMIT_DEG_PER_S * dt
+                    delta_cmd = pitch_target - self._pitch_down_cmd_deg
+                    if abs(delta_cmd) > max_step:
+                        pitch_target = self._pitch_down_cmd_deg + math.copysign(max_step, delta_cmd)
+                    self._pitch_down_cmd_deg = float(pitch_target)
+                    self._last_pitch_cmd_update_t = now
+                    pitch_live = True
+
+        self._update_handtracker_orientation()
+
         now = time.monotonic()
         if now - self._last_hand_log_t >= self._hand_log_interval_s:
             self._last_hand_log_t = now
             logger.info(
-                "Hand mapped -> ee.x=%.3f ee.y=%.3f ee.z=%.3f (xy %s, z %s)",
+                "Hand mapped -> ee.x=%.3f ee.y=%.3f ee.z=%.3f pitch_down=%.1f deg (xy %s, z %s, pitch %s:%s)",
                 self._state["ee.x"],
                 self._state["ee.y"],
                 self._state["ee.z"],
+                self._pitch_down_cmd_deg,
                 self._mapping_status(xy is not None, self._xy_mapping_enabled, self._xy_rebase_pending),
                 self._mapping_status(dz_norm is not None, self._z_mapping_enabled, self._z_rebase_pending),
+                self._pitch_mapping_mode,
+                "live" if pitch_live else ("waiting" if self._pitch_rebase_pending else "held"),
             )
 
     def get_action(self) -> dict[str, float]:
@@ -450,6 +561,9 @@ class KeyboardSOLeader(Teleoperator):
                         return
                     if lowered == "5":
                         self._toggle_mapping("Z")
+                        return
+                    if lowered == "6":
+                        self._toggle_pitch_mapping_mode()
                         return
 
                     if lowered == "w":

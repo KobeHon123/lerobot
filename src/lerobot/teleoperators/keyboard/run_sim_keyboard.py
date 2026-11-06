@@ -259,6 +259,8 @@ def _send_default_rerun_blueprint() -> None:
             rrb.TimeSeriesView(origin="hand_tracker/dy_norm"),
             rrb.TimeSeriesView(origin="hand_tracker/xy_scale"),
             rrb.TimeSeriesView(origin="hand_tracker/dz_norm"),
+            rrb.TimeSeriesView(origin="hand_tracker/pitch_2d_deg"),
+            rrb.TimeSeriesView(origin="hand_tracker/pitch_3d_deg"),
             rrb.TimeSeriesView(origin="hand_tracker/gripper_fraction"),
             rrb.TimeSeriesView(origin="teleop/target_ee"),
             rrb.TimeSeriesView(origin="teleop/observed_ee"),
@@ -307,6 +309,12 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Optional top camera transforms, in any order: rotate90/rotate180/rotate270, xmirror, ymirror. "
         "e.g. --top-cam 1 rotate180 xmirror. No mirroring is applied by default.",
+    )
+    parser.add_argument(
+        "--wrist-roll-offset-deg",
+        type=float,
+        default=90.0,
+        help="Roll applied to the start wrist orientation about the gripper axis (+ = clockwise looking along the gripper)",
     )
     parser.add_argument("--side-xmirror", action="store_true", help="Mirror side camera left/right")
     parser.add_argument("--side-ymirror", action="store_true", help="Mirror side camera up/down")
@@ -377,7 +385,9 @@ def main() -> None:
     follower_config.env_kwargs["render_mode"] = args.render_mode
     follower_config.env_kwargs["control_mode"] = "pd_ee_pose"
 
-    teleop_cfg = KeyboardSOLeaderConfig(handtracker_module=args.handtracker_module)
+    teleop_cfg = KeyboardSOLeaderConfig(
+        handtracker_module=args.handtracker_module, wrist_roll_offset_deg=args.wrist_roll_offset_deg
+    )
     cfg = TeleoperateConfig(
         teleop=teleop_cfg,
         robot=follower_config,
