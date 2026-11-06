@@ -181,6 +181,12 @@ class KeyboardSOLeader(Teleoperator):
     def _set_handtracker_logging_mode(self, mode: str) -> None:
         if self._handtracker is None:
             return
+        enabled = str(mode).lower() != "off"
+        if hasattr(self._handtracker, "enable_rerun_logging"):
+            try:
+                self._handtracker.enable_rerun_logging(enabled, mode)
+            except TypeError:
+                self._handtracker.enable_rerun_logging(enabled)
         setter = getattr(self._handtracker, "set_rerun_logging_mode", None)
         if callable(setter):
             setter(mode)
@@ -311,6 +317,78 @@ class KeyboardSOLeader(Teleoperator):
         if self._handtracker is not None and hasattr(self._handtracker, "get_xy_scale"):
             self._xy_scale = float(self._handtracker.get_xy_scale())
         return self._xy_scale
+
+    def _adjust_z_scale(self, delta_m: float) -> None:
+        if self._handtracker is not None and hasattr(self._handtracker, "adjust_z_scale"):
+            self._z_scale = float(self._handtracker.adjust_z_scale(delta_m))
+        else:
+            self._z_scale = max(0.01, min(0.30, self._z_scale + delta_m))
+        logger.info("Handtracker Z scale -> %.3f m", self._z_scale)
+
+    def _current_z_scale(self) -> float:
+        if self._handtracker is not None and hasattr(self._handtracker, "get_z_scale"):
+            self._z_scale = float(self._handtracker.get_z_scale())
+        return self._z_scale
+
+    @staticmethod
+    def _mapping_status(live: bool, enabled: bool, rebase_pending: bool) -> str:
+        if not enabled:
+            return "disabled"
+        if rebase_pending:
+            return "waiting for hand"
+        return "live" if live else "held"
+
+    def _normalize_key_char(self, key) -> str | None:
+        char = getattr(key, "char", None)
+        if char is not None:
+            return str(char)
+
+        key_str = str(key)
+        match = re.search(r"char='(.+)'", key_str)
+        if match is not None:
+            return match.group(1)
+
+        return None
+
+    def _read_relative_xy(self) -> dict[str, float] | None:
+        if self._handtracker is None or not hasattr(self._handtracker, "get_latest_xy"):
+            return None
+        try:
+            latest_xy = self._handtracker.get_latest_xy()
+            top = latest_xy.get("top") if isinstance(latest_xy, dict) else None
+            if top is None:
+                now = time.monotonic()
+                if now - self._last_xy_valid_t <= self._xy_hold_timeout_s:
+                    return self._last_relative_xy
+                return None
+            self._last_relative_xy = {
+                "dx_px": float(top.get("dx_px", 0.0)),
+                "dy_px": float(top.get("dy_px", 0.0)),
+                "dx_norm": float(top.get("dx_norm", 0.0)),
+                "dy_norm": float(top.get("dy_norm", 0.0)),
+            }
+            self._last_xy_valid_t = time.monotonic()
+            return self._last_relative_xy
+        except Exception:
+            logger.exception("Failed to read handtracker relative XY")
+            return None
+
+    def _read_relative_z(self) -> float | None:
+        if self._handtracker is None or not hasattr(self._handtracker, "get_latest_xy"):
+            return None
+        try:
+            side = self._handtracker.get_latest_xy().get("side")
+            now = time.monotonic()
+            if side is None:
+                if now - self._last_z_valid_t <= self._xy_hold_timeout_s:
+                    return self._last_relative_z
+                return None
+            self._last_relative_z = float(side.get("dz_norm", 0.0))
+            self._last_z_valid_t = now
+            return self._last_relative_z
+        except Exception:
+            logger.exception("Failed to read handtracker relative Z")
+            return None
 
     def _calibrate_hand_reference(self, xy: bool = True, z: bool = True) -> bool:
         """Reset the hand origin (top cam for XY, side cam for Z) to the current hand.
