@@ -56,8 +56,8 @@ PITCH_MODE_2D = "2d"
 PITCH_MODE_3D = "3d"
 PITCH_DEADZONE_DEG = 2.0
 PITCH_CLAMP_DEG = 40.0
-PITCH_EMA_ALPHA = 0.25
-PITCH_RATE_LIMIT_DEG_PER_S = 60.0
+PITCH_EMA_TAU_S = 0.15
+PITCH_RATE_LIMIT_DEG_PER_S = 120.0
 PITCH_GAIN_DEFAULT = 1.0
 PITCH_DOWN_MIN_DEG = 0.0
 PITCH_DOWN_MAX_DEG = 90.0
@@ -270,10 +270,13 @@ class KeyboardSOLeader(Teleoperator):
             "ee.y": float(self._state["ee.y"]),
             "ee.z": float(self._state["ee.z"]),
         }
-        self._orientation_lock = self._rolled_orientation(
-            (float(self._state["ee.wx"]), float(self._state["ee.wy"]), float(self._state["ee.wz"])),
-            self.config.wrist_roll_offset_deg,
-        )
+        measured = (float(self._state["ee.wx"]), float(self._state["ee.wy"]), float(self._state["ee.wz"]))
+        # Start the pitch command from the measured pose so entering handtracker mode does not jump.
+        tool_z = Rotation.from_rotvec(np.asarray(measured)).as_matrix()[:, 2]
+        pitch_down = math.degrees(math.atan2(-tool_z[2], math.hypot(tool_z[0], tool_z[1])))
+        self._pitch_down_cmd_deg = float(max(PITCH_DOWN_MIN_DEG, min(PITCH_DOWN_MAX_DEG, pitch_down)))
+        self._pitch_down_baseline_deg = self._pitch_down_cmd_deg
+        self._orientation_lock = self._rolled_orientation(measured, self.config.wrist_roll_offset_deg)
         self._apply_orientation_lock()
         logger.info("Seeded initial EE pose: %s", {k: self._state[k] for k in self.motors})
 
@@ -520,7 +523,9 @@ class KeyboardSOLeader(Teleoperator):
 
     def _update_handtracker_orientation(self) -> None:
         yaw = self._compute_env_yaw_rad()
-        orientation = self._compose_orientation(yaw, self._pitch_down_cmd_deg, local_roll_deg=0.0)
+        orientation = self._compose_orientation(
+            yaw, self._pitch_down_cmd_deg, local_roll_deg=self.config.wrist_roll_offset_deg
+        )
         self._orientation_lock = orientation
         self._apply_orientation_lock()
 
@@ -565,14 +570,14 @@ class KeyboardSOLeader(Teleoperator):
                     hand_delta = float(elevation - self._pitch_elevation_ref_deg)
                     hand_delta = self._apply_deadzone(hand_delta, PITCH_DEADZONE_DEG)
                     hand_delta = max(-PITCH_CLAMP_DEG, min(PITCH_CLAMP_DEG, hand_delta))
-                    self._last_pitch_delta_ema_deg = (
-                        PITCH_EMA_ALPHA * hand_delta + (1.0 - PITCH_EMA_ALPHA) * self._last_pitch_delta_ema_deg
-                    )
+                    now = time.monotonic()
+                    dt = max(1e-3, now - self._last_pitch_cmd_update_t)
+                    # Time-based smoothing so the response speed does not depend on loop rate.
+                    alpha = 1.0 - math.exp(-dt / PITCH_EMA_TAU_S)
+                    self._last_pitch_delta_ema_deg = alpha * hand_delta + (1.0 - alpha) * self._last_pitch_delta_ema_deg
                     pitch_target = self._pitch_down_baseline_deg - self._pitch_gain * self._last_pitch_delta_ema_deg
                     pitch_target = max(PITCH_DOWN_MIN_DEG, min(PITCH_DOWN_MAX_DEG, pitch_target))
 
-                    now = time.monotonic()
-                    dt = max(1e-3, now - self._last_pitch_cmd_update_t)
                     max_step = PITCH_RATE_LIMIT_DEG_PER_S * dt
                     delta_cmd = pitch_target - self._pitch_down_cmd_deg
                     if abs(delta_cmd) > max_step:
