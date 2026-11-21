@@ -49,8 +49,8 @@ MIN_XY_SCALE_M = 0.01
 # whole reachable workspace (x +-0.40 m), which 0.20 m could not.
 MAX_XY_SCALE_M = 0.40
 # Phase 1: perspective-independent (metric) measurements. Measure your own hand.
-PALM_LENGTH_M = 0.10  # wrist (0) -> middle finger MCP (9)
-PALM_WIDTH_M = 0.08  # index MCP (5) -> pinky MCP (17)
+PALM_LENGTH_M = 0.09  # wrist (0) -> middle finger MCP (9)
+PALM_WIDTH_M = 0.07  # index MCP (5) -> pinky MCP (17)
 SCALE_EMA_TAU_S = 0.3
 SCALE_MIN_PX = 30.0
 SCALE_JUMP_FRACTION = 0.30
@@ -67,6 +67,12 @@ METRIC_DEADZONE_M = HAND_RANGE_M * METRIC_DEADZONE_FRACTION
 MEASURE_SOURCE_PIXEL = "pixel"
 MEASURE_SOURCE_METRIC = "metric"
 AUX_LANDMARKS = (9, 17)
+# Pitch measurement hardening.
+WORLD_Y_SIGN = -1.0  # sign applied to the world-landmark y component of the 0->5 vector
+PITCH_MIN_SEG_FRACTION = 0.12  # 2D: min |0->5| as a fraction of frame height
+PITCH_MIN_SEG_3D_M = 0.03  # 3D: min |0->5| in world metres
+# Stale-state guard: hand tracker readings older than this read back as "no hand".
+STATE_STALE_TIMEOUT_S = 0.5
 # Latest control status pushed by the keyboard layer; logged to Rerun verbatim.
 _CONTROL_STATUS = "mode: 1 (keyboard)\n\nXY mapping: --\n\nZ mapping: --\n\npitch: --\n\nmeasure: --"
 DEFAULT_FRAME_WIDTH = 320
@@ -286,8 +292,18 @@ class HandTrackerService:
             return {label: frame.copy() for label, frame in self._latest_frames.items()}
 
     def get_latest_xy(self) -> dict[str, dict[str, float] | None]:
+        now = time.monotonic()
         with self._lock:
-            return {label: (state.copy() if state is not None else None) for label, state in self._latest_xy.items()}
+            out: dict[str, dict[str, float] | None] = {}
+            for label, state in self._latest_xy.items():
+                if state is None:
+                    out[label] = None
+                elif now - float(state.get("t", 0.0)) > STATE_STALE_TIMEOUT_S:
+                    # Stop handing out stale readings (e.g. frozen frames).
+                    out[label] = None
+                else:
+                    out[label] = state.copy()
+            return out
 
     def calibrate_open(self) -> None:
         with self._lock:
@@ -582,13 +598,16 @@ class HandTrackerService:
         self,
         points: dict[int, tuple[int, int]],
         hand_world_landmarks: Any,
+        frame_height: float,
     ) -> tuple[float | None, float | None]:
         """Compute hand elevation angle from wrist(0) -> index MCP(5).
 
-        Returns:
-            (pitch_2d_deg, pitch_3d_deg)
-            - 2D image-plane estimate: atan2(-dy_px, |dx_px|)
-            - 3D world-landmark estimate: atan2(-vy, hypot(vx, vz))
+        Returns ``(pitch_2d_deg, pitch_3d_deg)``:
+        - 2D image-plane estimate: ``atan2(-dy_px, |dx_px|)``
+        - 3D world-landmark estimate: ``atan2(WORLD_Y_SIGN*vy, hypot(vx, vz))``
+
+        An estimate is ``None`` when its reference segment is too short to be
+        reliable (near-vertical fingers make the 2D angle singular).
         """
         pitch_2d_deg: float | None = None
         pitch_3d_deg: float | None = None
@@ -598,7 +617,8 @@ class HandTrackerService:
             x5, y5 = points[5]
             dx_px = float(x5 - x0)
             dy_px = float(y5 - y0)
-            pitch_2d_deg = math.degrees(math.atan2(-dy_px, abs(dx_px)))
+            if math.hypot(dx_px, dy_px) >= PITCH_MIN_SEG_FRACTION * float(frame_height):
+                pitch_2d_deg = math.degrees(math.atan2(-dy_px, abs(dx_px)))
 
         try:
             w0 = hand_world_landmarks[0]
@@ -606,7 +626,8 @@ class HandTrackerService:
             vx = float(w5.x - w0.x)
             vy = float(w5.y - w0.y)
             vz = float(w5.z - w0.z)
-            pitch_3d_deg = math.degrees(math.atan2(-vy, math.hypot(vx, vz)))
+            if math.sqrt(vx * vx + vy * vy + vz * vz) >= PITCH_MIN_SEG_3D_M:
+                pitch_3d_deg = math.degrees(math.atan2(WORLD_Y_SIGN * vy, math.hypot(vx, vz)))
         except Exception:
             pitch_3d_deg = None
 
@@ -707,7 +728,9 @@ class HandTrackerService:
                 side_midpoint = self._compute_midpoint(points, 2, 5)
                 if side_midpoint is not None:
                     cv2.circle(display_frame, (int(side_midpoint[0]), int(side_midpoint[1])), 6, (255, 255, 0), -1)
-                side_pitch_2d_deg, side_pitch_3d_deg = self._compute_side_hand_elevation(points, hand_world_landmarks)
+                side_pitch_2d_deg, side_pitch_3d_deg = self._compute_side_hand_elevation(
+                    points, hand_world_landmarks, height
+                )
 
             if label == "top":
                 top_midpoint = self._compute_midpoint(points, 2, 5)
@@ -753,6 +776,8 @@ class HandTrackerService:
             else:
                 with self._lock:
                     self._update_scale("top", None, PALM_WIDTH_M)
+            if rel_xy is not None:
+                rel_xy["t"] = time.monotonic()
             with self._lock:
                 self._latest_xy["top"] = rel_xy
                 scale_now = float(self._xy_scale)
@@ -789,6 +814,8 @@ class HandTrackerService:
             else:
                 with self._lock:
                     self._update_scale("side", None, PALM_LENGTH_M)
+            if rel_z is not None:
+                rel_z["t"] = time.monotonic()
             with self._lock:
                 self._latest_xy["side"] = rel_z
                 z_scale_now = float(self._z_scale)
@@ -1012,6 +1039,8 @@ class HandTrackerService:
                         self._caps["side"] = None
                         self._landmarkers["side"] = None
                     side_frame = self._latest_frames.get("side", _black_frame())
+                    with self._lock:
+                        self._latest_xy["side"] = None
 
             top_cap = self._caps["top"]
             top_landmarker = self._landmarkers["top"]
@@ -1035,6 +1064,8 @@ class HandTrackerService:
                         self._caps["top"] = None
                         self._landmarkers["top"] = None
                     top_frame = self._latest_frames.get("top", _black_frame())
+                    with self._lock:
+                        self._latest_xy["top"] = None
 
             with self._lock:
                 self._latest_frames["side"] = side_frame

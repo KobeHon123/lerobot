@@ -12,14 +12,46 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from dataclasses import asdict
 from pprint import pformat
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# Warn when the commanded orientation changes by more than this between two ticks.
+ORIENTATION_JUMP_WARN_DEG = 15.0
+ORIENTATION_JUMP_WARN_COOLDOWN_S = 0.5
+
+
+def _rotvec_from_action(action: dict) -> np.ndarray | None:
+    if not all(k in action for k in ("ee.wx", "ee.wy", "ee.wz")):
+        return None
+    return np.array([float(action["ee.wx"]), float(action["ee.wy"]), float(action["ee.wz"])])
+
+
+def _tool_pitch_down_deg(rotvec: np.ndarray) -> float:
+    """Pitch of the tool z axis below horizontal, in degrees (0 = level, 90 = straight down)."""
+    # Imported lazily: this script adds its own sys.path entries inside main().
+    from lerobot.utils.rotation import Rotation
+
+    tool_z = Rotation.from_rotvec(np.asarray(rotvec, dtype=float)).as_matrix()[:, 2]
+    return math.degrees(math.atan2(-tool_z[2], math.hypot(tool_z[0], tool_z[1])))
+
+
+def _rotation_delta_deg(r1: np.ndarray, r2: np.ndarray) -> float:
+    from lerobot.utils.rotation import Rotation
+
+    delta = Rotation.from_rotvec(np.asarray(r1, dtype=float)).inv() * Rotation.from_rotvec(
+        np.asarray(r2, dtype=float)
+    )
+    return math.degrees(float(np.linalg.norm(delta.as_rotvec())))
 
 
 class _RerunEeLoggingRobot:
@@ -34,8 +66,14 @@ class _RerunEeLoggingRobot:
         self._compute_forward_kinematics_joints_to_ee = None
         self._kinematics = None
         self._motor_names: list[str] = []
+        self._teleop = None
+        self._last_target_rotvec: np.ndarray | None = None
+        self._last_orient_warn_t = 0.0
 
-        if self._enabled:
+        # Build FK/kinematics UNCONDITIONALLY so seed_initial_pose and the error
+        # diagnostics work even with --no-display-data. Only Rerun logging is gated
+        # by `enabled`.
+        try:
             from lerobot.model import RobotKinematics
             from lerobot.robots.so_follower.robot_kinematic_processor import compute_forward_kinematics_joints_to_ee
             from so101_nexus import get_so101_urdf_path  # type: ignore[import-not-found]
@@ -44,6 +82,12 @@ class _RerunEeLoggingRobot:
             self._compute_forward_kinematics_joints_to_ee = compute_forward_kinematics_joints_to_ee
             self._kinematics = RobotKinematics(str(get_so101_urdf_path()), SO101_TCP_FRAME_NAME)
             self._motor_names = list(getattr(robot, "motors", []))
+        except Exception:
+            logger.exception("Could not build FK/kinematics; observed-pose diagnostics unavailable")
+
+    def set_teleop(self, teleop) -> None:
+        """Give the logger access to the teleop so warnings can name the active keys/state."""
+        self._teleop = teleop
 
     def _overlay_overhead_grid(self, observation: dict) -> None:
         frame = observation.get("overhead")
@@ -73,7 +117,7 @@ class _RerunEeLoggingRobot:
         cv2.line(canvas, (0, cy), (w - 1, cy), axis_x_color, 2)
         cv2.line(canvas, (cx, 0), (cx, h - 1), axis_y_color, 2)
         cv2.circle(canvas, (cx, cy), 5, origin_color, -1)
-        cv2.putText(canvas, "origin", (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, origin_color, 1)
+        cv2.putText(canvas, "image center", (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, origin_color, 1)
         cv2.putText(canvas, "+X", (w - 38, cy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, axis_x_color, 2)
         cv2.putText(canvas, "+Y", (cx + 8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, axis_y_color, 2)
 
@@ -161,19 +205,82 @@ class _RerunEeLoggingRobot:
 
     def get_observation(self):
         observation = self._robot.get_observation()
-        self._overlay_overhead_grid(observation)
+        # The grid overlay is a visual aid only; skip it when not displaying.
+        if self._enabled:
+            self._overlay_overhead_grid(observation)
         self._last_observation = observation
         return observation
 
+    def _observed_env_pose(self, observation: dict[str, float]) -> dict[str, float]:
+        """FK of the current joints in the env (sim) frame, including orientation."""
+        if self._compute_forward_kinematics_joints_to_ee is None or self._kinematics is None:
+            return {}
+        return self._compute_forward_kinematics_joints_to_ee(
+            dict(observation), self._kinematics, self._motor_names
+        )
+
+    def _teleop_state_text(self) -> str:
+        teleop = self._teleop
+        if teleop is None:
+            return "teleop=?"
+        return (
+            f"last_key={getattr(teleop, '_last_key', None)}, "
+            f"control_mode={getattr(teleop, '_control_mode', '?')}, "
+            f"pitch_mode={getattr(teleop, '_pitch_mapping_mode', '?')}, "
+            f"pitch_cmd={float(getattr(teleop, '_pitch_down_cmd_deg', 0.0)):.1f}deg"
+        )
+
+    def _log_diagnostics(self, action: dict[str, float], target_rotvec: np.ndarray | None) -> None:
+        # Target orientation jump warning: always on, so it also helps with --no-display-data.
+        if target_rotvec is not None:
+            if self._last_target_rotvec is not None:
+                delta_deg = _rotation_delta_deg(self._last_target_rotvec, target_rotvec)
+                now = time.monotonic()
+                if delta_deg > ORIENTATION_JUMP_WARN_DEG and now - self._last_orient_warn_t > ORIENTATION_JUMP_WARN_COOLDOWN_S:
+                    self._last_orient_warn_t = now
+                    logger.warning("Target orientation jumped %.1f deg (%s)", delta_deg, self._teleop_state_text())
+            self._last_target_rotvec = target_rotvec
+
+        if not self._enabled or self._last_observation is None:
+            return
+        try:
+            import rerun as rr
+        except Exception:
+            return
+
+        try:
+            env_target = self._user_to_env_action(action)
+            observed = self._observed_env_pose(self._last_observation)
+            if not observed:
+                return
+
+            pos_err_mm = 1000.0 * math.sqrt(
+                (float(env_target.get("ee.x", 0.0)) - float(observed.get("ee.x", 0.0))) ** 2
+                + (float(env_target.get("ee.y", 0.0)) - float(observed.get("ee.y", 0.0))) ** 2
+                + (float(env_target.get("ee.z", 0.0)) - float(observed.get("ee.z", 0.0))) ** 2
+            )
+            rr.log("teleop/position_error_mm", rr.Scalars(pos_err_mm))
+
+            obs_rotvec = np.array(
+                [float(observed.get("ee.wx", 0.0)), float(observed.get("ee.wy", 0.0)), float(observed.get("ee.wz", 0.0))]
+            )
+            rr.log("teleop/observed_pitch_down_deg", rr.Scalars(_tool_pitch_down_deg(obs_rotvec)))
+            if target_rotvec is not None:
+                rr.log("teleop/target_pitch_down_deg", rr.Scalars(_tool_pitch_down_deg(target_rotvec)))
+                rr.log("teleop/orientation_error_deg", rr.Scalars(_rotation_delta_deg(target_rotvec, obs_rotvec)))
+        except Exception:
+            logger.exception("Failed to log EE diagnostics")
+
     def send_action(self, action):
+        target_rotvec = _rotvec_from_action(action)
         if self._enabled:
             self._log_pose("teleop/target_ee", self._target_pose(action))
         result = self._robot.send_action(self._user_to_env_action(action))
+        self._log_diagnostics(action, target_rotvec)
         if self._enabled and self._last_observation is not None:
             try:
                 self._log_pose("teleop/observed_ee", self._observed_pose(self._last_observation))
             except Exception:
-                logger = logging.getLogger(__name__)
                 logger.exception("Failed to log observed EE pose")
         return result
 
@@ -273,6 +380,10 @@ def _send_default_rerun_blueprint() -> None:
             rrb.TimeSeriesView(origin="hand_tracker/gripper_fraction"),
             rrb.TimeSeriesView(origin="teleop/target_ee"),
             rrb.TimeSeriesView(origin="teleop/observed_ee"),
+            rrb.TimeSeriesView(origin="teleop/target_pitch_down_deg"),
+            rrb.TimeSeriesView(origin="teleop/observed_pitch_down_deg"),
+            rrb.TimeSeriesView(origin="teleop/orientation_error_deg"),
+            rrb.TimeSeriesView(origin="teleop/position_error_mm"),
             rrb.TimeSeriesView(origin="action"),
         )
     )
@@ -424,11 +535,26 @@ def main() -> None:
     )
     try:
         teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+        try:
+            from so101_nexus.kinematics import (  # type: ignore[import-not-found]
+                EE_IK_ITERATIONS,
+                EE_ORIENTATION_WEIGHT,
+            )
+
+            logging.info(
+                "Sim IK config: EE_IK_ITERATIONS=%s, EE_ORIENTATION_WEIGHT=%s",
+                EE_IK_ITERATIONS,
+                EE_ORIENTATION_WEIGHT,
+            )
+        except Exception as exc:
+            logging.warning("Could not read sim IK config: %s", exc)
+
         teleop = make_teleoperator_from_config(cfg.teleop)
         robot = _RerunEeLoggingRobot(
             make_robot_from_config(cfg.robot),
             enabled=cfg.display_data and cfg.display_mode == "rerun",
         )
+        robot.set_teleop(teleop)
         teleop.connect()
         robot.connect()
 

@@ -102,6 +102,7 @@ class KeyboardSOLeader(Teleoperator):
         self._control_mode: str = CONTROL_MODE_KEYBOARD
         # 1 = keyboard, 2 = handtracker (lightweight logging), 3 = handtracker (full logging)
         self._active_mode: int = 1
+        self._last_key: str | None = None
         self._motion_baseline: dict[str, float] = {"ee.x": 0.0, "ee.y": 0.0, "ee.z": 0.15}
         self._xy_scale: float = 0.15
         self._keyboard_step: float = self.config.step_deg * 0.01
@@ -671,6 +672,7 @@ class KeyboardSOLeader(Teleoperator):
                 lowered_char = self._normalize_key_char(key)
                 if lowered_char is not None:
                     lowered = lowered_char.lower()
+                    self._last_key = lowered
 
                     if lowered == "1":
                         self._active_mode = 1
