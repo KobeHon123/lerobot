@@ -44,6 +44,16 @@ RERUN_IMAGE_EVERY_N = 3
 DEADZONE_FRAME_FRACTION = 0.0125
 MIN_XY_SCALE_M = 0.01
 MAX_XY_SCALE_M = 0.20
+# Phase 1: perspective-independent (metric) measurements. Measure your own hand.
+PALM_LENGTH_M = 0.10  # wrist (0) -> middle finger MCP (9)
+PALM_WIDTH_M = 0.08  # index MCP (5) -> pinky MCP (17)
+SCALE_EMA_TAU_S = 0.3
+SCALE_MIN_PX = 30.0
+SCALE_JUMP_FRACTION = 0.30
+HAND_RANGE_M = 0.20
+MEASURE_SOURCE_PIXEL = "pixel"
+MEASURE_SOURCE_METRIC = "metric"
+AUX_LANDMARKS = (9, 17)
 DEFAULT_FRAME_WIDTH = 320
 DEFAULT_FRAME_HEIGHT = 240
 BLACK_FRAME = np.zeros((DEFAULT_FRAME_HEIGHT, DEFAULT_FRAME_WIDTH, 3), dtype=np.uint8)
@@ -152,6 +162,22 @@ def _mirror_frame(frame: np.ndarray, x_mirror: bool = False, y_mirror: bool = Fa
     return frame
 
 
+def metric_height_m(v_mid: float, frame_height: float, px_per_m: float) -> float:
+    """Height above the image centre row, in metres. Image y points down, so up is positive."""
+    return -(v_mid - frame_height / 2.0) / px_per_m
+
+
+def metric_planar_m(
+    u_mid: float, v_mid: float, frame_width: float, frame_height: float, px_per_m: float
+) -> tuple[float, float]:
+    """Image-plane position relative to the image centre, in metres (+x right, +y up)."""
+    return (u_mid - frame_width / 2.0) / px_per_m, -(v_mid - frame_height / 2.0) / px_per_m
+
+
+def _clamp_unit(value: float) -> float:
+    return max(-1.0, min(1.0, value))
+
+
 class HandTrackerService:
     def __init__(
         self,
@@ -195,6 +221,16 @@ class HandTrackerService:
         self._side_z_mapper = RelativeXYMapper()
         self._z_scale = DEFAULT_Z_SCALE_M
         self._xy_scale = DEFAULT_XY_SCALE_M
+        self._measure_source = MEASURE_SOURCE_PIXEL
+        self._scale_state: dict[str, dict] = {
+            "side": {"px_per_m": None, "prev_len": None, "t": None, "valid": False},
+            "top": {"px_per_m": None, "prev_len": None, "t": None, "valid": False},
+        }
+        self._metric_ref: dict[str, Any] = {"side": None, "top": None}
+        self._last_metric_norm: dict[str, dict[str, float]] = {
+            "side": {"dz_norm": 0.0},
+            "top": {"dx_norm": 0.0, "dy_norm": 0.0},
+        }
 
     def start(self) -> None:
         if self._running:
@@ -238,11 +274,48 @@ class HandTrackerService:
                 if current is not None:
                     self._calib[label]["min_dist"] = current
 
+    def toggle_measure_source(self) -> str:
+        with self._lock:
+            if self._measure_source == MEASURE_SOURCE_PIXEL:
+                self._measure_source = MEASURE_SOURCE_METRIC
+            else:
+                self._measure_source = MEASURE_SOURCE_PIXEL
+            return self._measure_source
+
+    def get_measure_source(self) -> str:
+        with self._lock:
+            return self._measure_source
+
+    def _update_scale(self, label: str, seg_px: float | None, real_m: float) -> bool:
+        """Update the EMA px-per-metre scale for one camera. Returns scale_valid for this frame."""
+        st = self._scale_state[label]
+        if seg_px is None:
+            st["valid"] = False
+            return False
+        now = time.monotonic()
+        valid = seg_px >= SCALE_MIN_PX
+        prev = st["prev_len"]
+        if prev is not None and prev > 0 and abs(seg_px - prev) / prev > SCALE_JUMP_FRACTION:
+            valid = False
+        # Always remember the raw length so a real, persistent change re-validates next frame.
+        st["prev_len"] = seg_px
+        if valid:
+            raw = seg_px / real_m
+            if st["px_per_m"] is None or st["t"] is None:
+                st["px_per_m"] = raw
+            else:
+                alpha = 1.0 - math.exp(-max(1e-3, now - st["t"]) / SCALE_EMA_TAU_S)
+                st["px_per_m"] = alpha * raw + (1.0 - alpha) * st["px_per_m"]
+            st["t"] = now
+        st["valid"] = valid
+        return valid
+
     def calibrate_top_xy(self, midpoint: tuple[float, float] | None) -> None:
         if midpoint is None:
             return
         with self._lock:
             self._top_xy_mapper.reset(midpoint)
+            self._metric_ref["top"] = None
             # Drop the stale delta so the next read already reflects the new origin.
             top_state = self._latest_xy.get("top")
             if top_state is not None:
@@ -257,6 +330,7 @@ class HandTrackerService:
             return
         with self._lock:
             self._side_z_mapper.reset(midpoint)
+            self._metric_ref["side"] = None
             side_state = self._latest_xy.get("side")
             if side_state is not None:
                 side_state.update({"dz_px": 0.0, "dz_norm": 0.0})
@@ -269,6 +343,70 @@ class HandTrackerService:
     def get_z_scale(self) -> float:
         with self._lock:
             return float(self._z_scale)
+
+    def _attach_side_metric(
+        self, rel_z: dict[str, Any], midpoint: tuple[float, float], frame_height: int, seg_px: float | None
+    ) -> None:
+        with self._lock:
+            valid = self._update_scale("side", seg_px, PALM_LENGTH_M)
+            px = self._scale_state["side"]["px_per_m"]
+            rel_z["dz_norm_pixel"] = rel_z.get("dz_norm", 0.0)
+            rel_z["px_per_m"] = px
+            rel_z["scale_valid"] = valid
+            if px is None:
+                rel_z["z_m"] = None
+                rel_z["dz_m"] = 0.0
+            else:
+                z_m = metric_height_m(float(midpoint[1]), float(frame_height), float(px))
+                if self._metric_ref["side"] is None and valid:
+                    self._metric_ref["side"] = z_m
+                ref = self._metric_ref["side"]
+                dz_m = z_m - ref if ref is not None else 0.0
+                if valid and ref is not None:
+                    self._last_metric_norm["side"]["dz_norm"] = _clamp_unit(dz_m / HAND_RANGE_M)
+                rel_z["z_m"] = z_m
+                rel_z["dz_m"] = dz_m
+            rel_z["dz_norm_metric"] = self._last_metric_norm["side"]["dz_norm"]
+            if self._measure_source == MEASURE_SOURCE_METRIC:
+                rel_z["dz_norm"] = rel_z["dz_norm_metric"]
+
+    def _attach_top_metric(
+        self,
+        rel_xy: dict[str, Any],
+        midpoint: tuple[float, float],
+        frame_width: int,
+        frame_height: int,
+        seg_px: float | None,
+    ) -> None:
+        with self._lock:
+            valid = self._update_scale("top", seg_px, PALM_WIDTH_M)
+            px = self._scale_state["top"]["px_per_m"]
+            rel_xy["dx_norm_pixel"] = rel_xy.get("dx_norm", 0.0)
+            rel_xy["dy_norm_pixel"] = rel_xy.get("dy_norm", 0.0)
+            rel_xy["px_per_m"] = px
+            rel_xy["scale_valid"] = valid
+            if px is None:
+                rel_xy["dx_m"] = 0.0
+                rel_xy["dy_m"] = 0.0
+            else:
+                x_m, y_m = metric_planar_m(
+                    float(midpoint[0]), float(midpoint[1]), float(frame_width), float(frame_height), float(px)
+                )
+                if self._metric_ref["top"] is None and valid:
+                    self._metric_ref["top"] = (x_m, y_m)
+                ref = self._metric_ref["top"]
+                dx_m = x_m - ref[0] if ref is not None else 0.0
+                dy_m = y_m - ref[1] if ref is not None else 0.0
+                if valid and ref is not None:
+                    self._last_metric_norm["top"]["dx_norm"] = _clamp_unit(dx_m / HAND_RANGE_M)
+                    self._last_metric_norm["top"]["dy_norm"] = _clamp_unit(dy_m / HAND_RANGE_M)
+                rel_xy["dx_m"] = dx_m
+                rel_xy["dy_m"] = dy_m
+            rel_xy["dx_norm_metric"] = self._last_metric_norm["top"]["dx_norm"]
+            rel_xy["dy_norm_metric"] = self._last_metric_norm["top"]["dy_norm"]
+            if self._measure_source == MEASURE_SOURCE_METRIC:
+                rel_xy["dx_norm"] = rel_xy["dx_norm_metric"]
+                rel_xy["dy_norm"] = rel_xy["dy_norm_metric"]
 
     def _compute_relative_side_z(self, midpoint: tuple[float, float], frame_height: int) -> dict[str, float]:
         with self._lock:
@@ -423,6 +561,7 @@ class HandTrackerService:
         dist_cm_to_show = None
         top_midpoint = None
         side_midpoint = None
+        primary_seg_px: float | None = None
         side_pitch_2d_deg: float | None = None
         side_pitch_3d_deg: float | None = None
 
@@ -454,12 +593,26 @@ class HandTrackerService:
 
         for hand_landmarks, hand_world_landmarks in zip(results.hand_landmarks, results.hand_world_landmarks):
             points: dict[int, tuple[int, int]] = {}
+            aux_points: dict[int, tuple[int, int]] = {}
             for idx, landmark in enumerate(hand_landmarks):
                 if idx in ALLOWED_LANDMARKS:
                     x = int(landmark.x * width)
                     y = int(landmark.y * height)
                     points[idx] = (x, y)
                     cv2.circle(display_frame, (x, y), 5, (0, 255, 0), -1)
+            for idx in AUX_LANDMARKS:
+                aux_landmark = hand_landmarks[idx]
+                aux_points[idx] = (int(aux_landmark.x * width), int(aux_landmark.y * height))
+
+            # Palm segment used as the px-per-metre reference: side = wrist->middle MCP, top = index MCP->pinky MCP.
+            if label == "side" and 0 in points and AUX_LANDMARKS[0] in aux_points:
+                primary_seg_px = math.hypot(
+                    points[0][0] - aux_points[9][0], points[0][1] - aux_points[9][1]
+                )
+            elif label == "top" and 5 in points and AUX_LANDMARKS[1] in aux_points:
+                primary_seg_px = math.hypot(
+                    points[5][0] - aux_points[17][0], points[5][1] - aux_points[17][1]
+                )
 
             for connection in connections:
                 if connection.start in ALLOWED_LANDMARKS and connection.end in ALLOWED_LANDMARKS:
@@ -512,18 +665,35 @@ class HandTrackerService:
             rel_xy = None
             if top_midpoint is not None:
                 rel_xy = self._compute_relative_top_xy(top_midpoint, width)
+                self._attach_top_metric(rel_xy, top_midpoint, width, height, primary_seg_px)
+            else:
+                with self._lock:
+                    self._update_scale("top", None, PALM_WIDTH_M)
             with self._lock:
                 self._latest_xy["top"] = rel_xy
                 scale_now = float(self._xy_scale)
+                top_px_now = self._scale_state["top"]["px_per_m"]
+                top_valid_now = self._scale_state["top"]["valid"]
+                top_source_now = self._measure_source
 
             dx_norm_val = float(rel_xy.get("dx_norm", 0.0)) if rel_xy is not None else 0.0
             dy_norm_val = float(rel_xy.get("dy_norm", 0.0)) if rel_xy is not None else 0.0
 
             scale_text = f"XY scale {scale_now:.3f} m"
             norms_text = f"dx {dx_norm_val:.2f}  dy {dy_norm_val:.2f}"
-            cv2.rectangle(display_frame, (15, 108), (380, 190), (0, 0, 0), -1)
+            cv2.rectangle(display_frame, (15, 108), (380, 225), (0, 0, 0), -1)
             cv2.putText(display_frame, norms_text, (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3)
             cv2.putText(display_frame, scale_text, (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
+            px_text = "--" if top_px_now is None else f"{top_px_now:.0f}"
+            cv2.putText(
+                display_frame,
+                f"px/m {px_text} {'ok' if top_valid_now else 'BAD'}  src {top_source_now}",
+                (22, 214),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (200, 220, 255),
+                2,
+            )
 
         if label == "side":
             rel_z = None
@@ -531,17 +701,24 @@ class HandTrackerService:
                 rel_z = self._compute_relative_side_z(side_midpoint, height)
                 rel_z["pitch_2d_deg"] = side_pitch_2d_deg
                 rel_z["pitch_3d_deg"] = side_pitch_3d_deg
+                self._attach_side_metric(rel_z, side_midpoint, height, primary_seg_px)
+            else:
+                with self._lock:
+                    self._update_scale("side", None, PALM_LENGTH_M)
             with self._lock:
                 self._latest_xy["side"] = rel_z
                 z_scale_now = float(self._z_scale)
                 z_ref = self._side_z_mapper.reference
+                side_px_now = self._scale_state["side"]["px_per_m"]
+                side_valid_now = self._scale_state["side"]["valid"]
+                side_source_now = self._measure_source
 
             dz_norm_val = float(rel_z.get("dz_norm", 0.0)) if rel_z is not None else 0.0
             if z_ref is not None:
                 ref_y = int(z_ref[1])
                 cv2.line(display_frame, (0, ref_y), (width - 1, ref_y), (0, 255, 255), 1)
                 cv2.putText(display_frame, "z ref", (width - 90, max(ref_y - 6, 120)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-            cv2.rectangle(display_frame, (15, 108), (565, 230), (0, 0, 0), -1)
+            cv2.rectangle(display_frame, (15, 108), (565, 255), (0, 0, 0), -1)
             cv2.putText(display_frame, f"dz {dz_norm_val:+.2f}", (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3)
             cv2.putText(display_frame, f"Z scale {z_scale_now:.3f} m", (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
             pitch2d_text = "--" if side_pitch_2d_deg is None else f"{side_pitch_2d_deg:+.1f}"
@@ -552,6 +729,17 @@ class HandTrackerService:
                 (22, 218),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.85,
+                (200, 220, 255),
+                2,
+            )
+            side_px_text = "--" if side_px_now is None else f"{side_px_now:.0f}"
+            dz_m_text = "--" if rel_z is None else f"{float(rel_z.get('dz_m', 0.0)):+.3f}"
+            cv2.putText(
+                display_frame,
+                f"px/m {side_px_text} {'ok' if side_valid_now else 'BAD'}  dz_m {dz_m_text}  src {side_source_now}",
+                (22, 248),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
                 (200, 220, 255),
                 2,
             )
@@ -663,6 +851,19 @@ class HandTrackerService:
         z_scale = self.get_z_scale()
 
         rr.log("hand_tracker/dz_norm", rr.Scalars(dz_norm))
+        side_d = side_state if isinstance(side_state, dict) else {}
+        top_d = top_state if isinstance(top_state, dict) else {}
+        rr.log("hand_tracker/dz_m", rr.Scalars(float(side_d.get("dz_m") or 0.0)))
+        rr.log("hand_tracker/dx_m", rr.Scalars(float(top_d.get("dx_m") or 0.0)))
+        rr.log("hand_tracker/dy_m", rr.Scalars(float(top_d.get("dy_m") or 0.0)))
+        rr.log("hand_tracker/px_per_m_side", rr.Scalars(float(side_d.get("px_per_m") or 0.0)))
+        rr.log("hand_tracker/px_per_m_top", rr.Scalars(float(top_d.get("px_per_m") or 0.0)))
+        rr.log("hand_tracker/scale_valid_side", rr.Scalars(1.0 if side_d.get("scale_valid") else 0.0))
+        rr.log("hand_tracker/scale_valid_top", rr.Scalars(1.0 if top_d.get("scale_valid") else 0.0))
+        rr.log(
+            "hand_tracker/metric_source",
+            rr.Scalars(1.0 if self.get_measure_source() == MEASURE_SOURCE_METRIC else 0.0),
+        )
         rr.log("hand_tracker/z_scale", rr.Scalars(z_scale))
         rr.log("hand_tracker/pitch_2d_deg", rr.Scalars(pitch_2d_deg))
         rr.log("hand_tracker/pitch_3d_deg", rr.Scalars(pitch_3d_deg))
@@ -817,6 +1018,18 @@ def calibrate_open() -> None:
 def calibrate_closed() -> None:
     if _default_service is not None:
         _default_service.calibrate_closed()
+
+
+def toggle_measure_source() -> str:
+    if _default_service is not None:
+        return _default_service.toggle_measure_source()
+    return MEASURE_SOURCE_PIXEL
+
+
+def get_measure_source() -> str:
+    if _default_service is not None:
+        return _default_service.get_measure_source()
+    return MEASURE_SOURCE_PIXEL
 
 
 def calibrate_top_xy(midpoint: tuple[float, float] | None) -> None:

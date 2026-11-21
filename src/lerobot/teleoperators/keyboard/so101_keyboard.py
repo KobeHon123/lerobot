@@ -484,6 +484,18 @@ class KeyboardSOLeader(Teleoperator):
         else:
             self._set_pitch_mapping_mode(PITCH_MODE_2D)
 
+    def _toggle_measure_source(self) -> None:
+        if self._control_mode != CONTROL_MODE_HANDTRACKER:
+            logger.info("Measurement source toggle ignored: only available in handtracker modes (2 / 3)")
+            return
+        if self._handtracker is None or not hasattr(self._handtracker, "toggle_measure_source"):
+            logger.info("Measurement source toggle unavailable: handtracker module not loaded")
+            return
+        source = self._handtracker.toggle_measure_source()
+        self._xy_rebase_pending = True
+        self._z_rebase_pending = True
+        logger.info("Measurement source -> %s (re-basing XY and Z)", source)
+
     def _read_pitch_elevation_deg(self) -> float | None:
         if self._handtracker is None or not hasattr(self._handtracker, "get_latest_xy"):
             return None
@@ -647,6 +659,9 @@ class KeyboardSOLeader(Teleoperator):
                         return
                     if lowered == "6":
                         self._toggle_pitch_mapping_mode()
+                        return
+                    if lowered == "7":
+                        self._toggle_measure_source()
                         return
 
                     if lowered == "w":
