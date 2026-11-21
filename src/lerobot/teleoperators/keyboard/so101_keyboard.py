@@ -40,7 +40,8 @@ EE_POSE_KEYS = ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz")
 EE_GRIPPER_KEY = "ee.gripper_pos"
 CONTROL_MODE_KEYBOARD = "keyboard"
 CONTROL_MODE_HANDTRACKER = "handtracker"
-XY_SCALE_STEP_M = 0.005
+XY_SCALE_STEP_M = 0.01
+MAX_XY_SCALE_M = 0.40
 # User-frame XY limits (+y = forward in the overhead view). The sim accepts a
 # +/-0.55 m box with a max TCP reach of ~0.5457 m. Measured on the sim: sideways
 # +/-0.40 m and forward up to ~0.45 m are reached; the area close to the base is not.
@@ -99,6 +100,8 @@ class KeyboardSOLeader(Teleoperator):
         self._state["ee.z"] = 0.15
         self._listener = None
         self._control_mode: str = CONTROL_MODE_KEYBOARD
+        # 1 = keyboard, 2 = handtracker (lightweight logging), 3 = handtracker (full logging)
+        self._active_mode: int = 1
         self._motion_baseline: dict[str, float] = {"ee.x": 0.0, "ee.y": 0.0, "ee.z": 0.15}
         self._xy_scale: float = 0.15
         self._keyboard_step: float = self.config.step_deg * 0.01
@@ -313,7 +316,7 @@ class KeyboardSOLeader(Teleoperator):
         if self._handtracker is not None and hasattr(self._handtracker, "adjust_xy_scale"):
             self._xy_scale = float(self._handtracker.adjust_xy_scale(delta_m))
         else:
-            self._xy_scale = max(0.01, min(0.20, self._xy_scale + delta_m))
+            self._xy_scale = max(0.01, min(MAX_XY_SCALE_M, self._xy_scale + delta_m))
         logger.info("Handtracker XY scale -> %.3f m", self._xy_scale)
 
     def _current_xy_scale(self) -> float:
@@ -533,6 +536,34 @@ class KeyboardSOLeader(Teleoperator):
             return 0.0
         return math.copysign(abs(value) - deadzone, value)
 
+    def _current_measure_source(self) -> str:
+        if self._handtracker is not None and hasattr(self._handtracker, "get_measure_source"):
+            try:
+                return str(self._handtracker.get_measure_source())
+            except Exception:
+                return "pixel"
+        return "pixel"
+
+    def _control_status_text(self) -> str:
+        mode_label = {
+            1: "1 keyboard",
+            2: "2 handtracker (lightweight)",
+            3: "3 handtracker (full)",
+        }.get(self._active_mode, str(self._active_mode))
+        return (
+            f"mode: {mode_label}\n\n"
+            f"XY mapping: {'ENABLED' if self._xy_mapping_enabled else 'DISABLED'}\n\n"
+            f"Z mapping: {'ENABLED' if self._z_mapping_enabled else 'DISABLED'}\n\n"
+            f"pitch: {self._pitch_mapping_mode}\n\n"
+            f"measure: {self._current_measure_source()}\n\n"
+            f"xy_scale: {self._xy_scale:.3f} m\n\n"
+            f"z_scale: {self._z_scale:.3f} m"
+        )
+
+    def _push_control_status(self) -> None:
+        if self._handtracker is not None and hasattr(self._handtracker, "set_control_status"):
+            self._handtracker.set_control_status(self._control_status_text())
+
     def _update_handtracker_orientation(self) -> None:
         yaw = self._compute_env_yaw_rad()
         orientation = self._compose_orientation(
@@ -628,6 +659,8 @@ class KeyboardSOLeader(Teleoperator):
         if self._control_mode == CONTROL_MODE_HANDTRACKER:
             self._apply_motion_from_handtracker()
 
+        self._push_control_status()
+
         return {key: float(self._state[key]) for key in self.motors}
 
     def connect(self) -> None:
@@ -640,14 +673,17 @@ class KeyboardSOLeader(Teleoperator):
                     lowered = lowered_char.lower()
 
                     if lowered == "1":
+                        self._active_mode = 1
                         self._set_control_mode(CONTROL_MODE_KEYBOARD)
                         self._set_handtracker_logging_mode("off")
                         return
                     if lowered == "2":
+                        self._active_mode = 2
                         self._set_control_mode(CONTROL_MODE_HANDTRACKER)
                         self._set_handtracker_logging_mode("lightweight")
                         return
                     if lowered == "3":
+                        self._active_mode = 3
                         self._set_control_mode(CONTROL_MODE_HANDTRACKER)
                         self._set_handtracker_logging_mode("full")
                         return

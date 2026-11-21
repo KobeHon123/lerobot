@@ -34,7 +34,9 @@ if not MODEL_PATH.exists():
 
 ALLOWED_LANDMARKS = {0, 1, 2, 3, 4, 5, 6, 7, 8}
 DEFAULT_XY_SCALE_M = 0.15
-MAX_DELTA_FRAME_FRACTION = 0.25
+# Fraction of the frame width a hand must travel to reach full XY deflection.
+# Larger = more usable hand travel (finer control); previously 0.25.
+MAX_DELTA_FRAME_FRACTION = 0.35
 DEFAULT_Z_SCALE_M = 0.15
 MIN_Z_SCALE_M = 0.01
 MAX_Z_SCALE_M = 0.30
@@ -43,17 +45,30 @@ DEADZONE_HEIGHT_FRACTION = 0.0125
 RERUN_IMAGE_EVERY_N = 3
 DEADZONE_FRAME_FRACTION = 0.0125
 MIN_XY_SCALE_M = 0.01
-MAX_XY_SCALE_M = 0.20
+# Robot metres at full hand deflection. Raised so a full hand sweep can cross the
+# whole reachable workspace (x +-0.40 m), which 0.20 m could not.
+MAX_XY_SCALE_M = 0.40
 # Phase 1: perspective-independent (metric) measurements. Measure your own hand.
 PALM_LENGTH_M = 0.10  # wrist (0) -> middle finger MCP (9)
 PALM_WIDTH_M = 0.08  # index MCP (5) -> pinky MCP (17)
 SCALE_EMA_TAU_S = 0.3
 SCALE_MIN_PX = 30.0
 SCALE_JUMP_FRACTION = 0.30
+# A persistent change must agree for this many frames before it is accepted, so a
+# single glitch frame costs only one invalid frame (no double penalty).
+SCALE_PERSIST_FRAMES = 2
+# Re-anchor the metric origin if the hand was not seen for this long.
+SCALE_REANCHOR_TIMEOUT_S = 1.0
 HAND_RANGE_M = 0.20
+# Metric deadzone as a fraction of HAND_RANGE_M, so metric mode does not jitter
+# more than the pixel path does.
+METRIC_DEADZONE_FRACTION = 0.025
+METRIC_DEADZONE_M = HAND_RANGE_M * METRIC_DEADZONE_FRACTION
 MEASURE_SOURCE_PIXEL = "pixel"
 MEASURE_SOURCE_METRIC = "metric"
 AUX_LANDMARKS = (9, 17)
+# Latest control status pushed by the keyboard layer; logged to Rerun verbatim.
+_CONTROL_STATUS = "mode: 1 (keyboard)\n\nXY mapping: --\n\nZ mapping: --\n\npitch: --\n\nmeasure: --"
 DEFAULT_FRAME_WIDTH = 320
 DEFAULT_FRAME_HEIGHT = 240
 BLACK_FRAME = np.zeros((DEFAULT_FRAME_HEIGHT, DEFAULT_FRAME_WIDTH, 3), dtype=np.uint8)
@@ -178,6 +193,19 @@ def _clamp_unit(value: float) -> float:
     return max(-1.0, min(1.0, value))
 
 
+def _metric_deadzone(value_m: float, deadzone_m: float = METRIC_DEADZONE_M) -> float:
+    """Symmetric deadzone in metres, mirroring the pixel mapper's behaviour."""
+    if abs(value_m) <= deadzone_m:
+        return 0.0
+    return math.copysign(abs(value_m) - deadzone_m, value_m)
+
+
+def set_control_status(text: str) -> None:
+    """Store a status string (set by the keyboard layer) for Rerun logging."""
+    global _CONTROL_STATUS
+    _CONTROL_STATUS = str(text)
+
+
 class HandTrackerService:
     def __init__(
         self,
@@ -223,9 +251,10 @@ class HandTrackerService:
         self._xy_scale = DEFAULT_XY_SCALE_M
         self._measure_source = MEASURE_SOURCE_PIXEL
         self._scale_state: dict[str, dict] = {
-            "side": {"px_per_m": None, "prev_len": None, "t": None, "valid": False},
-            "top": {"px_per_m": None, "prev_len": None, "t": None, "valid": False},
+            "side": {"px_per_m": None, "last_valid_len": None, "pending_len": None, "pending_count": 0, "t": None, "valid": False},
+            "top": {"px_per_m": None, "last_valid_len": None, "pending_len": None, "pending_count": 0, "t": None, "valid": False},
         }
+        self._metric_last_seen_t: dict[str, float] = {"side": 0.0, "top": 0.0}
         self._metric_ref: dict[str, Any] = {"side": None, "top": None}
         self._last_metric_norm: dict[str, dict[str, float]] = {
             "side": {"dz_norm": 0.0},
@@ -291,15 +320,36 @@ class HandTrackerService:
         st = self._scale_state[label]
         if seg_px is None:
             st["valid"] = False
+            st["pending_len"] = None
+            st["pending_count"] = 0
             return False
         now = time.monotonic()
-        valid = seg_px >= SCALE_MIN_PX
-        prev = st["prev_len"]
-        if prev is not None and prev > 0 and abs(seg_px - prev) / prev > SCALE_JUMP_FRACTION:
-            valid = False
-        # Always remember the raw length so a real, persistent change re-validates next frame.
-        st["prev_len"] = seg_px
+        ok_len = seg_px >= SCALE_MIN_PX
+        # Compare against the last ACCEPTED length, not the previous raw length, so a
+        # lone glitch frame invalidates only itself.
+        ref_len = st["last_valid_len"]
+        if ref_len is None or ref_len <= 0:
+            jump_ok = True
+        else:
+            jump_ok = abs(seg_px - ref_len) / ref_len <= SCALE_JUMP_FRACTION
+        if jump_ok:
+            st["pending_len"] = None
+            st["pending_count"] = 0
+            confirmed = False
+        else:
+            # A genuinely persistent change keeps repeating; accept it once it has
+            # agreed for SCALE_PERSIST_FRAMES frames in a row.
+            pending = st["pending_len"]
+            if pending is not None and pending > 0 and abs(seg_px - pending) / pending <= SCALE_JUMP_FRACTION:
+                st["pending_count"] += 1
+            else:
+                st["pending_len"] = seg_px
+                st["pending_count"] = 1
+            confirmed = st["pending_count"] >= SCALE_PERSIST_FRAMES
+        valid = ok_len and (jump_ok or confirmed)
         if valid:
+            st["pending_len"] = None
+            st["pending_count"] = 0
             raw = seg_px / real_m
             if st["px_per_m"] is None or st["t"] is None:
                 st["px_per_m"] = raw
@@ -307,6 +357,7 @@ class HandTrackerService:
                 alpha = 1.0 - math.exp(-max(1e-3, now - st["t"]) / SCALE_EMA_TAU_S)
                 st["px_per_m"] = alpha * raw + (1.0 - alpha) * st["px_per_m"]
             st["t"] = now
+            st["last_valid_len"] = seg_px
         st["valid"] = valid
         return valid
 
@@ -316,10 +367,25 @@ class HandTrackerService:
         with self._lock:
             self._top_xy_mapper.reset(midpoint)
             self._metric_ref["top"] = None
+            # Clear the frozen metric norm too, otherwise a frame that is invalid
+            # right after a rebase would replay the pre-rebase offset.
+            self._last_metric_norm["top"]["dx_norm"] = 0.0
+            self._last_metric_norm["top"]["dy_norm"] = 0.0
             # Drop the stale delta so the next read already reflects the new origin.
             top_state = self._latest_xy.get("top")
             if top_state is not None:
-                top_state.update({"dx_px": 0.0, "dy_px": 0.0, "dx_norm": 0.0, "dy_norm": 0.0})
+                top_state.update(
+                    {
+                        "dx_px": 0.0,
+                        "dy_px": 0.0,
+                        "dx_norm": 0.0,
+                        "dy_norm": 0.0,
+                        "dx_m": 0.0,
+                        "dy_m": 0.0,
+                        "dx_norm_metric": 0.0,
+                        "dy_norm_metric": 0.0,
+                    }
+                )
 
     def adjust_smoothing(self, delta: float) -> None:
         with self._lock:
@@ -331,9 +397,12 @@ class HandTrackerService:
         with self._lock:
             self._side_z_mapper.reset(midpoint)
             self._metric_ref["side"] = None
+            self._last_metric_norm["side"]["dz_norm"] = 0.0
             side_state = self._latest_xy.get("side")
             if side_state is not None:
-                side_state.update({"dz_px": 0.0, "dz_norm": 0.0})
+                side_state.update(
+                    {"dz_px": 0.0, "dz_norm": 0.0, "dz_m": 0.0, "dz_norm_metric": 0.0}
+                )
 
     def adjust_z_scale(self, delta_m: float) -> float:
         with self._lock:
@@ -348,6 +417,11 @@ class HandTrackerService:
         self, rel_z: dict[str, Any], midpoint: tuple[float, float], frame_height: int, seg_px: float | None
     ) -> None:
         with self._lock:
+            now = time.monotonic()
+            # Re-anchor after a gap so a reappearing hand does not jump the target.
+            if self._metric_last_seen_t["side"] and now - self._metric_last_seen_t["side"] > SCALE_REANCHOR_TIMEOUT_S:
+                self._metric_ref["side"] = None
+            self._metric_last_seen_t["side"] = now
             valid = self._update_scale("side", seg_px, PALM_LENGTH_M)
             px = self._scale_state["side"]["px_per_m"]
             rel_z["dz_norm_pixel"] = rel_z.get("dz_norm", 0.0)
@@ -363,7 +437,9 @@ class HandTrackerService:
                 ref = self._metric_ref["side"]
                 dz_m = z_m - ref if ref is not None else 0.0
                 if valid and ref is not None:
-                    self._last_metric_norm["side"]["dz_norm"] = _clamp_unit(dz_m / HAND_RANGE_M)
+                    self._last_metric_norm["side"]["dz_norm"] = _clamp_unit(
+                        _metric_deadzone(dz_m) / HAND_RANGE_M
+                    )
                 rel_z["z_m"] = z_m
                 rel_z["dz_m"] = dz_m
             rel_z["dz_norm_metric"] = self._last_metric_norm["side"]["dz_norm"]
@@ -379,6 +455,10 @@ class HandTrackerService:
         seg_px: float | None,
     ) -> None:
         with self._lock:
+            now = time.monotonic()
+            if self._metric_last_seen_t["top"] and now - self._metric_last_seen_t["top"] > SCALE_REANCHOR_TIMEOUT_S:
+                self._metric_ref["top"] = None
+            self._metric_last_seen_t["top"] = now
             valid = self._update_scale("top", seg_px, PALM_WIDTH_M)
             px = self._scale_state["top"]["px_per_m"]
             rel_xy["dx_norm_pixel"] = rel_xy.get("dx_norm", 0.0)
@@ -398,8 +478,12 @@ class HandTrackerService:
                 dx_m = x_m - ref[0] if ref is not None else 0.0
                 dy_m = y_m - ref[1] if ref is not None else 0.0
                 if valid and ref is not None:
-                    self._last_metric_norm["top"]["dx_norm"] = _clamp_unit(dx_m / HAND_RANGE_M)
-                    self._last_metric_norm["top"]["dy_norm"] = _clamp_unit(dy_m / HAND_RANGE_M)
+                    self._last_metric_norm["top"]["dx_norm"] = _clamp_unit(
+                        _metric_deadzone(dx_m) / HAND_RANGE_M
+                    )
+                    self._last_metric_norm["top"]["dy_norm"] = _clamp_unit(
+                        _metric_deadzone(dy_m) / HAND_RANGE_M
+                    )
                 rel_xy["dx_m"] = dx_m
                 rel_xy["dy_m"] = dy_m
             rel_xy["dx_norm_metric"] = self._last_metric_norm["top"]["dx_norm"]
@@ -655,10 +739,10 @@ class HandTrackerService:
                 dist_cm_to_show = smoothed_dist * 100
 
         if norm_val_to_show is not None:
-            status_text = f"{label.upper()}  Range: {norm_val_to_show:.2f}   Dist: {dist_cm_to_show:.1f} cm"
+            status_text = f"{label.upper()}  r{norm_val_to_show:.2f}  d{dist_cm_to_show:.1f}cm"
             color = (0, 255, 255)
         else:
-            status_text = f"{label.upper()}  (no hand detected)"
+            status_text = f"{label.upper()}  no hand"
             color = (0, 0, 255)
 
         if label == "top":
@@ -681,18 +765,18 @@ class HandTrackerService:
 
             scale_text = f"XY scale {scale_now:.3f} m"
             norms_text = f"dx {dx_norm_val:.2f}  dy {dy_norm_val:.2f}"
-            cv2.rectangle(display_frame, (15, 108), (380, 225), (0, 0, 0), -1)
-            cv2.putText(display_frame, norms_text, (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3)
-            cv2.putText(display_frame, scale_text, (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
             px_text = "--" if top_px_now is None else f"{top_px_now:.0f}"
+            cv2.rectangle(display_frame, (6, 40), (250, 92), (0, 0, 0), -1)
+            cv2.putText(display_frame, norms_text, (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(display_frame, scale_text, (10, 71), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
             cv2.putText(
                 display_frame,
                 f"px/m {px_text} {'ok' if top_valid_now else 'BAD'}  src {top_source_now}",
-                (22, 214),
+                (10, 86),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
+                0.42,
                 (200, 220, 255),
-                2,
+                1,
             )
 
         if label == "side":
@@ -717,35 +801,35 @@ class HandTrackerService:
             if z_ref is not None:
                 ref_y = int(z_ref[1])
                 cv2.line(display_frame, (0, ref_y), (width - 1, ref_y), (0, 255, 255), 1)
-                cv2.putText(display_frame, "z ref", (width - 90, max(ref_y - 6, 120)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-            cv2.rectangle(display_frame, (15, 108), (565, 255), (0, 0, 0), -1)
-            cv2.putText(display_frame, f"dz {dz_norm_val:+.2f}", (22, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3)
-            cv2.putText(display_frame, f"Z scale {z_scale_now:.3f} m", (22, 182), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
-            pitch2d_text = "--" if side_pitch_2d_deg is None else f"{side_pitch_2d_deg:+.1f}"
-            pitch3d_text = "--" if side_pitch_3d_deg is None else f"{side_pitch_3d_deg:+.1f}"
-            cv2.putText(
-                display_frame,
-                f"pitch2d {pitch2d_text} deg   pitch3d {pitch3d_text} deg",
-                (22, 218),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.85,
-                (200, 220, 255),
-                2,
-            )
+                cv2.putText(display_frame, "z ref", (width - 62, max(ref_y - 5, 44)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            pitch2d_text = "--" if side_pitch_2d_deg is None else f"{side_pitch_2d_deg:+.0f}"
+            pitch3d_text = "--" if side_pitch_3d_deg is None else f"{side_pitch_3d_deg:+.0f}"
             side_px_text = "--" if side_px_now is None else f"{side_px_now:.0f}"
             dz_m_text = "--" if rel_z is None else f"{float(rel_z.get('dz_m', 0.0)):+.3f}"
+            cv2.rectangle(display_frame, (6, 40), (285, 106), (0, 0, 0), -1)
+            cv2.putText(display_frame, f"dz {dz_norm_val:+.2f}", (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+            cv2.putText(display_frame, f"Z scale {z_scale_now:.3f} m", (10, 71), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+            cv2.putText(
+                display_frame,
+                f"pitch2d {pitch2d_text}  pitch3d {pitch3d_text} deg",
+                (10, 86),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (200, 220, 255),
+                1,
+            )
             cv2.putText(
                 display_frame,
                 f"px/m {side_px_text} {'ok' if side_valid_now else 'BAD'}  dz_m {dz_m_text}  src {side_source_now}",
-                (22, 248),
+                (10, 100),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.4,
                 (200, 220, 255),
-                2,
+                1,
             )
 
-        cv2.rectangle(display_frame, (0, 0), (width, 100), (0, 0, 0), -1)
-        cv2.putText(display_frame, status_text, (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 2)
+        cv2.rectangle(display_frame, (0, 0), (width, 34), (0, 0, 0), -1)
+        cv2.putText(display_frame, status_text, (6, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         return cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB), norm_val_to_show
 
@@ -864,6 +948,8 @@ class HandTrackerService:
             "hand_tracker/metric_source",
             rr.Scalars(1.0 if self.get_measure_source() == MEASURE_SOURCE_METRIC else 0.0),
         )
+        # Control state pushed by the keyboard layer (mode / mappings / pitch / source).
+        rr.log("hand_tracker/control_status", rr.TextDocument(_CONTROL_STATUS))
         rr.log("hand_tracker/z_scale", rr.Scalars(z_scale))
         rr.log("hand_tracker/pitch_2d_deg", rr.Scalars(pitch_2d_deg))
         rr.log("hand_tracker/pitch_3d_deg", rr.Scalars(pitch_3d_deg))
