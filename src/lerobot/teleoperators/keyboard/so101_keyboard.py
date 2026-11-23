@@ -63,6 +63,13 @@ PITCH_GAIN_DEFAULT = 1.0
 PITCH_DOWN_MIN_DEG = 0.0
 PITCH_DOWN_MAX_DEG = 90.0
 PITCH_DOWN_DEFAULT_DEG = 45.0
+# Pitch tick timing: the dt used by the EMA / rate limit is refreshed every tick and
+# clamped, so the first update after a gap cannot bypass the rate limit.
+PITCH_DT_MIN_S = 1e-3
+PITCH_DT_MAX_S = 0.1
+# If the pitch measurement has been unavailable for longer than this, re-anchor the
+# reference to the hand's current elevation when it comes back.
+PITCH_REBASE_TIMEOUT_S = 1.0
 
 
 @TeleoperatorConfig.register_subclass("keyboard_so_leader")
@@ -131,7 +138,13 @@ class KeyboardSOLeader(Teleoperator):
         self._last_pitch_measurement_deg: float = 0.0
         self._pitch_hold_timeout_s: float = self._xy_hold_timeout_s
         self._last_pitch_cmd_update_t: float = time.monotonic()
-        self._last_env_yaw_rad: float = 0.0
+        self._pitch_gap_s: float = 0.0
+        # Seeded start pose and the per-session pitch frame (delta-from-seed).
+        self._seed_position: dict[str, float] = {"ee.x": 0.0, "ee.y": 0.0, "ee.z": 0.15}
+        self._seed_orientation_lock: dict[str, float] = dict(LOCKED_ORIENTATION)
+        self._pitch_R_base: np.ndarray | None = None
+        self._pitch_axis_n: np.ndarray | None = None
+        self._pitch_down_seed_deg: float = PITCH_DOWN_DEFAULT_DEG
 
         # Optional handtracker integration
         self._handtracker = None
@@ -183,14 +196,11 @@ class KeyboardSOLeader(Teleoperator):
             self._state[key] = float(value)
 
     def _set_handtracker_logging_mode(self, mode: str) -> None:
+        # Only select the Rerun logging MODE here. The global "display enabled" flag is
+        # owned by the --display-data path and must never be flipped from the keyboard,
+        # otherwise pressing 2/3 under --no-display-data would try to log with no session.
         if self._handtracker is None:
             return
-        enabled = str(mode).lower() != "off"
-        if hasattr(self._handtracker, "enable_rerun_logging"):
-            try:
-                self._handtracker.enable_rerun_logging(enabled, mode)
-            except TypeError:
-                self._handtracker.enable_rerun_logging(enabled)
         setter = getattr(self._handtracker, "set_rerun_logging_mode", None)
         if callable(setter):
             setter(mode)
@@ -213,39 +223,57 @@ class KeyboardSOLeader(Teleoperator):
         logger.info("Control mode switched to: %s", self._control_mode)
 
     @staticmethod
-    def _rot_z(theta_rad: float) -> np.ndarray:
-        c = math.cos(theta_rad)
-        s = math.sin(theta_rad)
-        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+    def _rot_axis_angle(axis: np.ndarray, theta_rad: float) -> np.ndarray:
+        """Rodrigues rotation matrix about a (not necessarily unit) axis."""
+        k = np.asarray(axis, dtype=float)
+        norm = float(np.linalg.norm(k))
+        if norm < 1e-12:
+            return np.eye(3)
+        k = k / norm
+        skew = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+        return np.eye(3) + math.sin(theta_rad) * skew + (1.0 - math.cos(theta_rad)) * (skew @ skew)
 
-    @staticmethod
-    def _rot_y(theta_rad: float) -> np.ndarray:
-        c = math.cos(theta_rad)
-        s = math.sin(theta_rad)
-        return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=float)
+    def _init_pitch_frame(self) -> None:
+        """Derive the per-session pitch frame from the seeded (locked) orientation.
 
-    def _compose_orientation(self, yaw_rad: float, pitch_down_deg: float, local_roll_deg: float = 0.0) -> dict[str, float]:
-        # R_target = Rz(yaw) * Ry(90deg + pitch_down) * Rz_local(roll)
-        r_target = (
-            self._rot_z(yaw_rad)
-            @ self._rot_y(math.radians(90.0 + float(pitch_down_deg)))
-            @ self._rot_z(math.radians(float(local_roll_deg)))
+        The pitch command is then a rotation of the seed pose about a fixed horizontal
+        axis ``n``, so at ``pitch_cmd == pitch_down_seed`` the target equals the seed
+        orientation exactly (no jump when entering modes 2/3).
+        """
+        rotvec = np.array(
+            [
+                float(self._orientation_lock["ee.wx"]),
+                float(self._orientation_lock["ee.wy"]),
+                float(self._orientation_lock["ee.wz"]),
+            ]
         )
-        rotvec = Rotation.from_matrix(r_target).as_rotvec()
-        return {"ee.wx": float(rotvec[0]), "ee.wy": float(rotvec[1]), "ee.wz": float(rotvec[2])}
-
-    def _compute_env_yaw_rad(self) -> float:
-        # User frame -> env frame mapping (same transform as run_sim_keyboard adapter)
-        # env_x = user_y, env_y = -user_x
-        user_x = float(self._state["ee.x"])
-        user_y = float(self._state["ee.y"])
-        env_x = user_y
-        env_y = -user_x
-        if abs(env_x) < 1e-6 and abs(env_y) < 1e-6:
-            return self._last_env_yaw_rad
-        yaw = math.atan2(env_y, env_x)
-        self._last_env_yaw_rad = yaw
-        return yaw
+        r_base = Rotation.from_rotvec(rotvec).as_matrix()
+        approach = r_base[:, 2]  # tool z axis in world = gripper approach axis
+        self._pitch_R_base = r_base
+        self._pitch_down_seed_deg = math.degrees(math.asin(max(-1.0, min(1.0, -float(approach[2])))))
+        azimuth = math.atan2(float(approach[1]), float(approach[0]))
+        self._pitch_axis_n = np.array([-math.sin(azimuth), math.cos(azimuth), 0.0])
+        self._pitch_down_cmd_deg = float(self._pitch_down_seed_deg)
+        self._pitch_down_baseline_deg = float(self._pitch_down_seed_deg)
+        self._last_pitch_delta_ema_deg = 0.0
+        # Self-check: at the seed pitch the target must reproduce the seed orientation.
+        check = self._rot_axis_angle(self._pitch_axis_n, 0.0) @ r_base
+        err = Rotation.from_matrix(np.asarray(check, dtype=float)).inv() * Rotation.from_matrix(
+            np.asarray(r_base, dtype=float)
+        )
+        logger.info(
+            "Pitch frame: seed pitch_down=%.2f deg, azimuth=%.1f deg, axis=(%.3f, %.3f, %.3f), "
+            "approach=(%.3f, %.3f, %.3f), self-check=%.4f deg",
+            self._pitch_down_seed_deg,
+            math.degrees(azimuth),
+            float(self._pitch_axis_n[0]),
+            float(self._pitch_axis_n[1]),
+            float(self._pitch_axis_n[2]),
+            float(approach[0]),
+            float(approach[1]),
+            float(approach[2]),
+            math.degrees(float(np.linalg.norm(err.as_rotvec()))),
+        )
 
     def seed_initial_pose(self, pose: dict[str, float]) -> None:
         aliases = {
@@ -275,12 +303,14 @@ class KeyboardSOLeader(Teleoperator):
             "ee.z": float(self._state["ee.z"]),
         }
         measured = (float(self._state["ee.wx"]), float(self._state["ee.wy"]), float(self._state["ee.wz"]))
-        # Start the pitch command from the measured pose so entering handtracker mode does not jump.
-        tool_z = Rotation.from_rotvec(np.asarray(measured)).as_matrix()[:, 2]
-        pitch_down = math.degrees(math.atan2(-tool_z[2], math.hypot(tool_z[0], tool_z[1])))
-        self._pitch_down_cmd_deg = float(max(PITCH_DOWN_MIN_DEG, min(PITCH_DOWN_MAX_DEG, pitch_down)))
-        self._pitch_down_baseline_deg = self._pitch_down_cmd_deg
         self._orientation_lock = self._rolled_orientation(measured, self.config.wrist_roll_offset_deg)
+        self._seed_orientation_lock = dict(self._orientation_lock)
+        self._seed_position = {
+            "ee.x": float(self._state["ee.x"]),
+            "ee.y": float(self._state["ee.y"]),
+            "ee.z": float(self._state["ee.z"]),
+        }
+        self._init_pitch_frame()
         self._apply_orientation_lock()
         logger.info("Seeded initial EE pose: %s", {k: self._state[k] for k in self.motors})
 
@@ -514,6 +544,9 @@ class KeyboardSOLeader(Teleoperator):
                     return self._last_pitch_measurement_deg
                 return None
             value = float(side.get(key, 0.0))
+            # Gap since the previous *fresh* reading (not the held value). Used to decide
+            # whether the reference must be re-anchored after the hand comes back.
+            self._pitch_gap_s = now - self._last_pitch_valid_t if self._last_pitch_valid_t > 0.0 else 0.0
             self._last_pitch_measurement_deg = value
             self._last_pitch_valid_t = now
             return value
@@ -566,12 +599,45 @@ class KeyboardSOLeader(Teleoperator):
             self._handtracker.set_control_status(self._control_status_text())
 
     def _update_handtracker_orientation(self) -> None:
-        yaw = self._compute_env_yaw_rad()
-        orientation = self._compose_orientation(
-            yaw, self._pitch_down_cmd_deg, local_roll_deg=self.config.wrist_roll_offset_deg
-        )
-        self._orientation_lock = orientation
+        """Rotate the seeded orientation about a fixed horizontal axis by the pitch delta.
+
+        At ``pitch_cmd == pitch_down_seed`` this reproduces the seed orientation exactly,
+        so entering modes 2/3 (or moving the hand sideways) no longer jumps the target.
+        """
+        if self._pitch_R_base is None or self._pitch_axis_n is None:
+            return
+        delta_rad = math.radians(self._pitch_down_cmd_deg - self._pitch_down_seed_deg)
+        r_target = self._rot_axis_angle(self._pitch_axis_n, delta_rad) @ self._pitch_R_base
+        rotvec = Rotation.from_matrix(np.asarray(r_target, dtype=float)).as_rotvec()
+        self._orientation_lock = {
+            "ee.wx": float(rotvec[0]),
+            "ee.wy": float(rotvec[1]),
+            "ee.wz": float(rotvec[2]),
+        }
         self._apply_orientation_lock()
+
+    def _reset_to_seed(self) -> None:
+        """Key x: send the arm back to the seeded start pose and re-anchor the hand there."""
+        for key in ("ee.x", "ee.y", "ee.z"):
+            self._state[key] = self._clamp_state(key, float(self._seed_position.get(key, self._state[key])))
+        self._motion_baseline = {k: float(self._state[k]) for k in ("ee.x", "ee.y", "ee.z")}
+        self._orientation_lock = dict(self._seed_orientation_lock)
+        self._apply_orientation_lock()
+        self._pitch_down_cmd_deg = float(self._pitch_down_seed_deg)
+        self._pitch_down_baseline_deg = float(self._pitch_down_seed_deg)
+        self._last_pitch_delta_ema_deg = 0.0
+        self._pitch_elevation_ref_deg = None
+        self._pitch_rebase_pending = self._pitch_mapping_mode != PITCH_MODE_OFF
+        # The hand's current pose becomes the new neutral; rebase on the next handtracker tick.
+        self._xy_rebase_pending = True
+        self._z_rebase_pending = True
+        logger.info(
+            "Reset to seed pose: ee=(%.3f, %.3f, %.3f), pitch_down=%.1f deg",
+            self._state["ee.x"],
+            self._state["ee.y"],
+            self._state["ee.z"],
+            self._pitch_down_cmd_deg,
+        )
 
     def _apply_motion_from_handtracker(self) -> None:
         xy = None
@@ -599,6 +665,12 @@ class KeyboardSOLeader(Teleoperator):
             target_z = self._motion_baseline["ee.z"] + dz_norm * self._current_z_scale()
             self._state["ee.z"] = self._clamp_state("ee.z", target_z)
 
+        # Refresh the pitch tick clock EVERY tick and clamp dt, so the first update after
+        # a gap (hand lost, rebase) cannot bypass the rate limit.
+        pitch_now = time.monotonic()
+        pitch_dt = max(PITCH_DT_MIN_S, min(PITCH_DT_MAX_S, pitch_now - self._last_pitch_cmd_update_t))
+        self._last_pitch_cmd_update_t = pitch_now
+
         pitch_live = False
         if self._pitch_mapping_mode != PITCH_MODE_OFF:
             if self._pitch_rebase_pending:
@@ -610,25 +682,35 @@ class KeyboardSOLeader(Teleoperator):
                     )
             else:
                 elevation = self._read_pitch_elevation_deg()
-                if elevation is not None and self._pitch_elevation_ref_deg is not None:
-                    hand_delta = float(elevation - self._pitch_elevation_ref_deg)
-                    hand_delta = self._apply_deadzone(hand_delta, PITCH_DEADZONE_DEG)
-                    hand_delta = max(-PITCH_CLAMP_DEG, min(PITCH_CLAMP_DEG, hand_delta))
-                    now = time.monotonic()
-                    dt = max(1e-3, now - self._last_pitch_cmd_update_t)
-                    # Time-based smoothing so the response speed does not depend on loop rate.
-                    alpha = 1.0 - math.exp(-dt / PITCH_EMA_TAU_S)
-                    self._last_pitch_delta_ema_deg = alpha * hand_delta + (1.0 - alpha) * self._last_pitch_delta_ema_deg
-                    pitch_target = self._pitch_down_baseline_deg - self._pitch_gain * self._last_pitch_delta_ema_deg
-                    pitch_target = max(PITCH_DOWN_MIN_DEG, min(PITCH_DOWN_MAX_DEG, pitch_target))
+                if elevation is not None:
+                    if self._pitch_elevation_ref_deg is None or self._pitch_gap_s > PITCH_REBASE_TIMEOUT_S:
+                        # Hand was gone long enough: re-anchor to the current elevation.
+                        self._pitch_elevation_ref_deg = float(elevation)
+                        self._pitch_down_baseline_deg = float(self._pitch_down_cmd_deg)
+                        self._last_pitch_delta_ema_deg = 0.0
+                        logger.info(
+                            "Pitch reference auto-re-based after %.2fs gap at %.2f deg",
+                            self._pitch_gap_s,
+                            float(elevation),
+                        )
+                    else:
+                        hand_delta = float(elevation - self._pitch_elevation_ref_deg)
+                        hand_delta = self._apply_deadzone(hand_delta, PITCH_DEADZONE_DEG)
+                        hand_delta = max(-PITCH_CLAMP_DEG, min(PITCH_CLAMP_DEG, hand_delta))
+                        # Time-based smoothing so the response speed does not depend on loop rate.
+                        alpha = 1.0 - math.exp(-pitch_dt / PITCH_EMA_TAU_S)
+                        self._last_pitch_delta_ema_deg = (
+                            alpha * hand_delta + (1.0 - alpha) * self._last_pitch_delta_ema_deg
+                        )
+                        pitch_target = self._pitch_down_baseline_deg - self._pitch_gain * self._last_pitch_delta_ema_deg
+                        pitch_target = max(PITCH_DOWN_MIN_DEG, min(PITCH_DOWN_MAX_DEG, pitch_target))
 
-                    max_step = PITCH_RATE_LIMIT_DEG_PER_S * dt
-                    delta_cmd = pitch_target - self._pitch_down_cmd_deg
-                    if abs(delta_cmd) > max_step:
-                        pitch_target = self._pitch_down_cmd_deg + math.copysign(max_step, delta_cmd)
-                    self._pitch_down_cmd_deg = float(pitch_target)
-                    self._last_pitch_cmd_update_t = now
-                    pitch_live = True
+                        max_step = PITCH_RATE_LIMIT_DEG_PER_S * pitch_dt
+                        delta_cmd = pitch_target - self._pitch_down_cmd_deg
+                        if abs(delta_cmd) > max_step:
+                            pitch_target = self._pitch_down_cmd_deg + math.copysign(max_step, delta_cmd)
+                        self._pitch_down_cmd_deg = float(pitch_target)
+                        pitch_live = True
 
         self._update_handtracker_orientation()
 
@@ -711,7 +793,7 @@ class KeyboardSOLeader(Teleoperator):
                     elif lowered == "c" and self._handtracker is not None and hasattr(self._handtracker, "calibrate_closed"):
                         self._handtracker.calibrate_closed()
                     elif lowered == "x":
-                        self._calibrate_hand_reference()
+                        self._reset_to_seed()
                     elif lowered == "q" and self._control_mode == CONTROL_MODE_HANDTRACKER:
                         self._adjust_xy_scale(-XY_SCALE_STEP_M)
                         return
