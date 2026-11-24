@@ -463,7 +463,13 @@ class HandTrackerService:
                 rel_z["dz_m"] = dz_m
             rel_z["dz_norm_metric"] = self._last_metric_norm["side"]["dz_norm"]
             if self._measure_source == MEASURE_SOURCE_METRIC:
-                rel_z["dz_norm"] = rel_z["dz_norm_metric"]
+                # Same fallback as the top camera: keep Z responsive when the metric
+                # scale is unavailable instead of freezing at 0.
+                metric_usable = valid and px is not None and self._metric_ref["side"] is not None
+                rel_z["metric_fallback"] = not metric_usable
+                if metric_usable:
+                    rel_z["dz_norm"] = rel_z["dz_norm_metric"]
+            rel_z["measure_source"] = self._measure_source
 
     def _attach_top_metric(
         self,
@@ -508,8 +514,16 @@ class HandTrackerService:
             rel_xy["dx_norm_metric"] = self._last_metric_norm["top"]["dx_norm"]
             rel_xy["dy_norm_metric"] = self._last_metric_norm["top"]["dy_norm"]
             if self._measure_source == MEASURE_SOURCE_METRIC:
-                rel_xy["dx_norm"] = rel_xy["dx_norm_metric"]
-                rel_xy["dy_norm"] = rel_xy["dy_norm_metric"]
+                # Metric mode needs a valid px/m scale. If the palm segment is too
+                # short or a landmark is missing, the metric norm stays frozen at 0
+                # and XY would look "disabled". Fall back to the pixel mapping in
+                # that case so the arm keeps responding.
+                metric_usable = valid and px is not None and self._metric_ref["top"] is not None
+                rel_xy["metric_fallback"] = not metric_usable
+                if metric_usable:
+                    rel_xy["dx_norm"] = rel_xy["dx_norm_metric"]
+                    rel_xy["dy_norm"] = rel_xy["dy_norm_metric"]
+            rel_xy["measure_source"] = self._measure_source
 
     def _compute_relative_side_z(self, midpoint: tuple[float, float], frame_height: int) -> dict[str, float]:
         with self._lock:
@@ -909,7 +923,7 @@ class HandTrackerService:
         reference = self._top_xy_mapper.reference
         if isinstance(top_state, dict):
             self._logger.info(
-                "Top XY: frame=%dx%d max_delta_px=%.0f ref=%s mid=(%.0f,%.0f) dx_px=%.1f dy_px=%.1f dx_norm=%+.2f dy_norm=%+.2f",
+                "Top XY: frame=%dx%d max_delta_px=%.0f ref=%s mid=(%.0f,%.0f) dx_px=%.1f dy_px=%.1f dx_norm=%+.2f dy_norm=%+.2f measure=%s px_per_m=%s valid=%s metric_fallback=%s",
                 top_shape[1],
                 top_shape[0],
                 self._top_xy_mapper.max_delta_px,
@@ -920,17 +934,25 @@ class HandTrackerService:
                 top_state.get("dy_px", 0.0),
                 top_state.get("dx_norm", 0.0),
                 top_state.get("dy_norm", 0.0),
+                top_state.get("measure_source", "?"),
+                "None" if top_state.get("px_per_m") is None else f"{float(top_state.get('px_per_m')):.0f}",
+                top_state.get("scale_valid"),
+                top_state.get("metric_fallback"),
             )
         else:
             self._logger.info("Top XY: frame=%dx%d hand NOT detected", top_shape[1], top_shape[0])
         side_state = self.get_latest_xy().get("side")
         if isinstance(side_state, dict):
             self._logger.info(
-                "Side Z: dz_px=%.1f dz_norm=%+.2f z_scale=%.3f max_delta_px=%.0f pitch2d=%s pitch3d=%s",
+                "Side Z: dz_px=%.1f dz_norm=%+.2f z_scale=%.3f max_delta_px=%.0f measure=%s px_per_m=%s valid=%s metric_fallback=%s pitch2d=%s pitch3d=%s",
                 side_state.get("dz_px", 0.0),
                 side_state.get("dz_norm", 0.0),
                 side_state.get("z_scale", 0.0),
                 MAX_DELTA_HEIGHT_FRACTION * side_shape[0],
+                side_state.get("measure_source", "?"),
+                "None" if side_state.get("px_per_m") is None else f"{float(side_state.get('px_per_m')):.0f}",
+                side_state.get("scale_valid"),
+                side_state.get("metric_fallback"),
                 "--"
                 if side_state.get("pitch_2d_deg") is None
                 else f"{float(side_state.get('pitch_2d_deg', 0.0)):+.2f}",
