@@ -28,6 +28,22 @@ logger = logging.getLogger(__name__)
 # Warn when the commanded orientation changes by more than this between two ticks.
 ORIENTATION_JUMP_WARN_DEG = 15.0
 ORIENTATION_JUMP_WARN_COOLDOWN_S = 0.5
+# Safety net: if the sim's observed orientation stays this far from the commanded
+# orientation for this many consecutive frames, the IK has dropped into a mirrored
+# solution. Return to the seed pose and re-anchor the hand.
+ORIENTATION_RECOVER_DEG = 90.0
+ORIENTATION_RECOVER_FRAMES = 10
+ORIENTATION_RECOVER_COOLDOWN_S = 3.0
+# Periodic text log of the target/observed orientation so the cause of a "points at
+# the ceiling" event is visible without opening Rerun.
+DIAGNOSTICS_LOG_INTERVAL_S = 2.0
+# Seed the arm at env x ~= 0.30 (user-frame y) so there is room on both sides before
+# the unreachable region near the base (env x < 0.20).
+SEED_ENV_X = 0.30
+SEED_WARMUP_STEPS = 35
+SEED_WARMUP_STABLE_STEPS = 5
+SEED_WARMUP_TOLERANCE_M = 0.01
+SEED_WARMUP_ROT_TOLERANCE_DEG = 1.0
 
 
 def _rotvec_from_action(action: dict) -> np.ndarray | None:
@@ -54,6 +70,53 @@ def _rotation_delta_deg(r1: np.ndarray, r2: np.ndarray) -> float:
     return math.degrees(float(np.linalg.norm(delta.as_rotvec())))
 
 
+def _warmup_to_seed_position(
+    robot, initial_pose: dict[str, float], gripper_value: float
+) -> dict[str, float]:
+    """Move the arm to the seed position (env x ~= SEED_ENV_X) and let it settle.
+
+    The sim starts with the arm close to the base (env x ~= 0.225), where the IK can
+    saturate and flip the gripper. Moving forward first gives the hand tracker room on
+    both sides. Returns the observed pose after settling (falls back to ``initial_pose``
+    if the FK is unavailable).
+    """
+    action = {
+        "ee.x": 0.0,  # user x -> env y
+        "ee.y": SEED_ENV_X,  # user y -> env x
+        "ee.z": float(initial_pose.get("ee.z", 0.15)),
+        "ee.wx": float(initial_pose.get("ee.wx", 0.0)),
+        "ee.wy": float(initial_pose.get("ee.wy", 0.0)),
+        "ee.wz": float(initial_pose.get("ee.wz", 0.0)),
+        "ee.gripper_pos": float(gripper_value),
+    }
+    observed = dict(initial_pose)
+    previous = dict(initial_pose)
+    stable = 0
+    for _ in range(SEED_WARMUP_STEPS):
+        robot.send_action(action)
+        observation = robot.get_observation()
+        pose = robot.get_observed_ee_pose(observation)
+        if not pose:
+            return previous
+        observed = pose
+        pos_err = abs(float(pose.get("ee.y", 0.0)) - SEED_ENV_X)
+        rot_err = _rotation_delta_deg(
+            [previous.get("ee.wx", 0.0), previous.get("ee.wy", 0.0), previous.get("ee.wz", 0.0)],
+            [pose.get("ee.wx", 0.0), pose.get("ee.wy", 0.0), pose.get("ee.wz", 0.0)],
+        )
+        previous = dict(pose)
+        # The arm can pass through a momentarily "stable" transient on its way to the
+        # real steady state (position converges before orientation), so require several
+        # consecutive stable steps before stopping.
+        if pos_err < SEED_WARMUP_TOLERANCE_M and rot_err < SEED_WARMUP_ROT_TOLERANCE_DEG:
+            stable += 1
+            if stable >= SEED_WARMUP_STABLE_STEPS:
+                break
+        else:
+            stable = 0
+    return observed
+
+
 class _RerunEeLoggingRobot:
     def __init__(self, robot, enabled: bool) -> None:
         self._robot = robot
@@ -69,6 +132,11 @@ class _RerunEeLoggingRobot:
         self._teleop = None
         self._last_target_rotvec: np.ndarray | None = None
         self._last_orient_warn_t = 0.0
+        # Orientation watchdog state (runs even when Rerun logging is disabled).
+        self._watchdog_enabled = False
+        self._orient_bad_frames = 0
+        self._last_recover_t = 0.0
+        self._last_diag_log_t = 0.0
 
         # Build FK/kinematics UNCONDITIONALLY so seed_initial_pose and the error
         # diagnostics work even with --no-display-data. Only Rerun logging is gated
@@ -88,6 +156,11 @@ class _RerunEeLoggingRobot:
     def set_teleop(self, teleop) -> None:
         """Give the logger access to the teleop so warnings can name the active keys/state."""
         self._teleop = teleop
+
+    def enable_watchdog(self) -> None:
+        """Start the orientation watchdog once the teleop has been seeded."""
+        self._watchdog_enabled = True
+        self._last_diag_log_t = time.monotonic()
 
     def _overlay_overhead_grid(self, observation: dict) -> None:
         frame = observation.get("overhead")
@@ -271,11 +344,86 @@ class _RerunEeLoggingRobot:
         except Exception:
             logger.exception("Failed to log EE diagnostics")
 
+    def _check_orientation_watchdog(self, action: dict[str, float], target_rotvec: np.ndarray | None) -> None:
+        """Log target/observed orientation and recover from a mirrored IK solution.
+
+        Runs on every send_action, even when Rerun logging is disabled, so a "points at
+        the ceiling" event is visible in the text log.
+        """
+        if target_rotvec is None or self._last_observation is None:
+            return
+        if not self._watchdog_enabled:
+            return
+        observed = self._observed_env_pose(self._last_observation)
+        if not observed:
+            return
+
+        obs_rotvec = np.array(
+            [
+                float(observed.get("ee.wx", 0.0)),
+                float(observed.get("ee.wy", 0.0)),
+                float(observed.get("ee.wz", 0.0)),
+            ]
+        )
+        target_pitch = _tool_pitch_down_deg(target_rotvec)
+        observed_pitch = _tool_pitch_down_deg(obs_rotvec)
+        orient_err = _rotation_delta_deg(target_rotvec, obs_rotvec)
+
+        env_target = self._user_to_env_action(action)
+        pos_err_mm = 1000.0 * math.sqrt(
+            (float(env_target.get("ee.x", 0.0)) - float(observed.get("ee.x", 0.0))) ** 2
+            + (float(env_target.get("ee.y", 0.0)) - float(observed.get("ee.y", 0.0))) ** 2
+            + (float(env_target.get("ee.z", 0.0)) - float(observed.get("ee.z", 0.0))) ** 2
+        )
+
+        now = time.monotonic()
+        if now - self._last_diag_log_t >= DIAGNOSTICS_LOG_INTERVAL_S:
+            self._last_diag_log_t = now
+            logger.info(
+                "EE diag: target_pitch=%.1fdeg observed_pitch=%.1fdeg orient_err=%.1fdeg "
+                "pos_err=%.1fmm (%s)",
+                target_pitch,
+                observed_pitch,
+                orient_err,
+                pos_err_mm,
+                self._teleop_state_text(),
+            )
+
+        # Recovery: only when the orientation error is large and sustained.
+        if orient_err > ORIENTATION_RECOVER_DEG:
+            self._orient_bad_frames += 1
+        else:
+            self._orient_bad_frames = 0
+
+        if (
+            self._orient_bad_frames >= ORIENTATION_RECOVER_FRAMES
+            and now - self._last_recover_t >= ORIENTATION_RECOVER_COOLDOWN_S
+            and self._teleop is not None
+            and hasattr(self._teleop, "recover_orientation")
+        ):
+            self._last_recover_t = now
+            self._orient_bad_frames = 0
+            logger.warning(
+                "Orientation watchdog: observed orientation stayed %.1fdeg from target "
+                "(target_pitch=%.1fdeg observed_pitch=%.1fdeg, pos_err=%.1fmm); "
+                "returning to seed pose (%s)",
+                orient_err,
+                target_pitch,
+                observed_pitch,
+                pos_err_mm,
+                self._teleop_state_text(),
+            )
+            try:
+                self._teleop.recover_orientation(reason="orientation watchdog")
+            except Exception:
+                logger.exception("Orientation recovery failed")
+
     def send_action(self, action):
         target_rotvec = _rotvec_from_action(action)
         if self._enabled:
             self._log_pose("teleop/target_ee", self._target_pose(action))
         result = self._robot.send_action(self._user_to_env_action(action))
+        self._check_orientation_watchdog(action, target_rotvec)
         self._log_diagnostics(action, target_rotvec)
         if self._enabled and self._last_observation is not None:
             try:
@@ -560,9 +708,14 @@ def main() -> None:
 
         initial_observation = robot.get_observation()
         initial_pose = robot.get_observed_ee_pose(initial_observation)
+        if initial_pose:
+            logging.info("Initial observed EE pose: %s", initial_pose)
+            gripper_value = float(initial_observation.get("gripper.pos", 0.0))
+            initial_pose = _warmup_to_seed_position(robot, initial_pose, gripper_value)
+            logging.info("Seeding teleop from warmed-up EE pose: %s", initial_pose)
         if hasattr(teleop, "seed_initial_pose") and initial_pose:
-            logging.info("Initial observed EE pose for seeding: %s", initial_pose)
             teleop.seed_initial_pose(initial_pose)
+        robot.enable_watchdog()
 
         try:
             teleop_loop(

@@ -45,10 +45,16 @@ MAX_XY_SCALE_M = 0.40
 # User-frame XY limits (+y = forward in the overhead view). The sim accepts a
 # +/-0.55 m box with a max TCP reach of ~0.5457 m. Measured on the sim: sideways
 # +/-0.40 m and forward up to ~0.45 m are reached; the area close to the base is not.
+#
+# User-frame y maps to env x. Below env x ~0.20 the IK saturates the shoulder/elbow
+# joints and drops into a mirrored solution, so the gripper flips to point at the
+# ceiling. The old y floor of -0.25 asked for targets *behind* the base. Keep the
+# floor at 0.20 so an unreachable target is never commanded.
 EE_X_LIMIT_M = 0.40
-EE_Y_MIN_M = -0.25
+EE_Y_MIN_M = 0.20
 EE_Y_MAX_M = 0.45
-EE_Z_MIN_M = 0.02
+# z below ~0.02 is blocked by the table/joint limits; keep a small margin.
+EE_Z_MIN_M = 0.05
 EE_Z_MAX_M = 0.40
 Z_SCALE_STEP_M = 0.01
 LOCKED_ORIENTATION = {"ee.wx": 0.0, "ee.wy": 0.0, "ee.wz": 0.0}
@@ -329,8 +335,11 @@ class KeyboardSOLeader(Teleoperator):
     def _reset_pose(self) -> None:
         self._state = {key: 0.0 for key in self.motors}
         self._state["ee.z"] = 0.15
+        # Clamp through the normal limits so "r" can never command an unreachable target.
+        for key in ("ee.x", "ee.y", "ee.z"):
+            self._state[key] = self._clamp_state(key, float(self._state[key]))
         self._apply_orientation_lock()
-        self._motion_baseline = {"ee.x": 0.0, "ee.y": 0.0, "ee.z": 0.15}
+        self._motion_baseline = {k: float(self._state[k]) for k in ("ee.x", "ee.y", "ee.z")}
         logger.info("Reset end-effector targets to defaults")
 
     def _move_keyboard_xy(self, dx: float, dy: float) -> None:
@@ -616,7 +625,7 @@ class KeyboardSOLeader(Teleoperator):
         }
         self._apply_orientation_lock()
 
-    def _reset_to_seed(self) -> None:
+    def _reset_to_seed(self, reason: str = "manual") -> None:
         """Key x: send the arm back to the seeded start pose and re-anchor the hand there."""
         for key in ("ee.x", "ee.y", "ee.z"):
             self._state[key] = self._clamp_state(key, float(self._seed_position.get(key, self._state[key])))
@@ -632,12 +641,23 @@ class KeyboardSOLeader(Teleoperator):
         self._xy_rebase_pending = True
         self._z_rebase_pending = True
         logger.info(
-            "Reset to seed pose: ee=(%.3f, %.3f, %.3f), pitch_down=%.1f deg",
+            "Reset to seed pose (%s): ee=(%.3f, %.3f, %.3f), pitch_down=%.1f deg",
+            reason,
             self._state["ee.x"],
             self._state["ee.y"],
             self._state["ee.z"],
             self._pitch_down_cmd_deg,
         )
+
+    def recover_orientation(self, reason: str = "orientation watchdog") -> None:
+        """Safety net: return to the known-good seed pose and re-anchor the hand.
+
+        Called by the runner when the sim's observed orientation stays far from the
+        commanded orientation (the IK dropped into a mirrored solution, e.g. the
+        gripper points at the ceiling). Re-anchoring the hand reference means the arm
+        does not jump back to the bad target on the next tick.
+        """
+        self._reset_to_seed(reason=reason)
 
     def _apply_motion_from_handtracker(self) -> None:
         xy = None
