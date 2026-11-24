@@ -40,7 +40,10 @@ MAX_DELTA_FRAME_FRACTION = 0.35
 DEFAULT_Z_SCALE_M = 0.15
 MIN_Z_SCALE_M = 0.01
 MAX_Z_SCALE_M = 0.30
-MAX_DELTA_HEIGHT_FRACTION = 0.30
+# Side cam Z: fraction of the frame height a hand must travel to reach full
+# deflection. Relaxed to 0.50 (was 0.30) so the side cam needs more hand travel
+# per metre of arm motion, i.e. it is less twitchy than the top cam.
+MAX_DELTA_HEIGHT_FRACTION = 0.50
 DEADZONE_HEIGHT_FRACTION = 0.0125
 RERUN_IMAGE_EVERY_N = 3
 DEADZONE_FRAME_FRACTION = 0.0125
@@ -902,6 +905,7 @@ class HandTrackerService:
         top_state = self.get_latest_xy().get("top")
         with self._lock:
             top_shape = self._latest_frames["top"].shape
+            side_shape = self._latest_frames["side"].shape
         reference = self._top_xy_mapper.reference
         if isinstance(top_state, dict):
             self._logger.info(
@@ -922,10 +926,11 @@ class HandTrackerService:
         side_state = self.get_latest_xy().get("side")
         if isinstance(side_state, dict):
             self._logger.info(
-                "Side Z: dz_px=%.1f dz_norm=%+.2f z_scale=%.3f pitch2d=%s pitch3d=%s",
+                "Side Z: dz_px=%.1f dz_norm=%+.2f z_scale=%.3f max_delta_px=%.0f pitch2d=%s pitch3d=%s",
                 side_state.get("dz_px", 0.0),
                 side_state.get("dz_norm", 0.0),
                 side_state.get("z_scale", 0.0),
+                MAX_DELTA_HEIGHT_FRACTION * side_shape[0],
                 "--"
                 if side_state.get("pitch_2d_deg") is None
                 else f"{float(side_state.get('pitch_2d_deg', 0.0)):+.2f}",

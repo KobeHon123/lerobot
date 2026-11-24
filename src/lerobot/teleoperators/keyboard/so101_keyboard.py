@@ -53,8 +53,12 @@ MAX_XY_SCALE_M = 0.40
 EE_X_LIMIT_M = 0.40
 EE_Y_MIN_M = 0.20
 EE_Y_MAX_M = 0.45
-# z below ~0.02 is blocked by the table/joint limits; keep a small margin.
-EE_Z_MIN_M = 0.05
+# Measured reach: with the arm at env x ~0.30 the gripper tips stop ~8 mm above
+# the floor (TCP ~0.016 m); the shoulder_lift/wrist_flex joints saturate below
+# that. The old 0.05 clamp stopped the arm 3-4 cm short of its physical limit, so
+# the gripper could never approach the floor. 0.02 lets the arm reach its real
+# limit while still leaving a margin above the floor.
+EE_Z_MIN_M = 0.02
 EE_Z_MAX_M = 0.40
 Z_SCALE_STEP_M = 0.01
 LOCKED_ORIENTATION = {"ee.wx": 0.0, "ee.wy": 0.0, "ee.wz": 0.0}
