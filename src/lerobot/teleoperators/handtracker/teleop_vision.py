@@ -74,10 +74,15 @@ AUX_LANDMARKS = (9, 17)
 WORLD_Y_SIGN = -1.0  # sign applied to the world-landmark y component of the 0->5 vector
 PITCH_MIN_SEG_FRACTION = 0.12  # 2D: min |0->5| as a fraction of frame height
 PITCH_MIN_SEG_3D_M = 0.03  # 3D: min |0->5| in world metres
+# Roll measurement (top cam): palm roll from the thumb-root (1) -> index-root (5)
+# axis. Landmarks 5/17 collapse in the top view, so this axis is used instead.
+ROLL_MIN_SEG_FRACTION = 0.03  # min |1->5| as a fraction of frame width
 # Stale-state guard: hand tracker readings older than this read back as "no hand".
 STATE_STALE_TIMEOUT_S = 0.5
 # Latest control status pushed by the keyboard layer; logged to Rerun verbatim.
-_CONTROL_STATUS = "mode: 1 (keyboard)\n\nXY mapping: --\n\nZ mapping: --\n\npitch: --\n\nmeasure: --"
+_CONTROL_STATUS = (
+    "mode: 1 (keyboard)\n\nXY mapping: --\n\nZ mapping: --\n\npitch: --\n\nroll: --\n\nmeasure: --"
+)
 DEFAULT_FRAME_WIDTH = 320
 DEFAULT_FRAME_HEIGHT = 240
 BLACK_FRAME = np.zeros((DEFAULT_FRAME_HEIGHT, DEFAULT_FRAME_WIDTH, 3), dtype=np.uint8)
@@ -258,7 +263,9 @@ class HandTrackerService:
         self._side_z_mapper = RelativeXYMapper()
         self._z_scale = DEFAULT_Z_SCALE_M
         self._xy_scale = DEFAULT_XY_SCALE_M
-        self._measure_source = MEASURE_SOURCE_PIXEL
+        # Handtracker modes 2/3 default to the perspective-independent metric path;
+        # key 8 switches back to the raw pixel path.
+        self._measure_source = MEASURE_SOURCE_METRIC
         self._scale_state: dict[str, dict] = {
             "side": {"px_per_m": None, "last_valid_len": None, "pending_len": None, "pending_count": 0, "t": None, "valid": False},
             "top": {"px_per_m": None, "last_valid_len": None, "pending_len": None, "pending_count": 0, "t": None, "valid": False},
@@ -650,6 +657,29 @@ class HandTrackerService:
 
         return pitch_2d_deg, pitch_3d_deg
 
+    def _compute_top_roll_deg(
+        self,
+        points: dict[int, tuple[int, int]],
+        frame_width: int,
+    ) -> float | None:
+        """Compute the palm roll angle from the thumb-root (1) -> index-root (5) axis.
+
+        In the top (overhead) view the hand points into the image, so the 5/17
+        palm-width reference collapses onto itself. The 1->5 axis stays in the image
+        plane and rotates as the hand rolls about its forward axis, so the angle is
+        ``atan2(dy, dx)`` in image coordinates. It is ``None`` when the segment is too
+        short to be reliable; the keyboard layer subtracts a per-session reference so
+        enabling roll does not jump the target.
+        """
+        if 1 in points and 5 in points:
+            x1, y1 = points[1]
+            x5, y5 = points[5]
+            dx = float(x5 - x1)
+            dy = float(y5 - y1)
+            if math.hypot(dx, dy) >= ROLL_MIN_SEG_FRACTION * float(frame_width):
+                return math.degrees(math.atan2(dy, dx))
+        return None
+
     def _compute_relative_top_xy(self, midpoint: tuple[float, float], frame_width: int) -> dict[str, float]:
         with self._lock:
             self._top_xy_mapper.max_delta_px = MAX_DELTA_FRAME_FRACTION * frame_width
@@ -686,6 +716,7 @@ class HandTrackerService:
         primary_seg_px: float | None = None
         side_pitch_2d_deg: float | None = None
         side_pitch_3d_deg: float | None = None
+        top_roll_deg: float | None = None
 
         def _draw_top_xy_axes() -> None:
             if label != "top":
@@ -754,6 +785,10 @@ class HandTrackerService:
                 if top_midpoint is not None:
                     cv2.circle(display_frame, (int(top_midpoint[0]), int(top_midpoint[1])), 6, (255, 255, 0), -1)
 
+                top_roll_deg = self._compute_top_roll_deg(points, width)
+                if 1 in points and 5 in points:
+                    cv2.line(display_frame, points[1], points[5], (0, 165, 255), 3)
+
                 _draw_top_xy_axes()
 
             if 4 in points and 8 in points:
@@ -789,6 +824,7 @@ class HandTrackerService:
             rel_xy = None
             if top_midpoint is not None:
                 rel_xy = self._compute_relative_top_xy(top_midpoint, width)
+                rel_xy["roll_deg"] = top_roll_deg
                 self._attach_top_metric(rel_xy, top_midpoint, width, height, primary_seg_px)
             else:
                 with self._lock:
@@ -808,7 +844,8 @@ class HandTrackerService:
             scale_text = f"XY scale {scale_now:.3f} m"
             norms_text = f"dx {dx_norm_val:.2f}  dy {dy_norm_val:.2f}"
             px_text = "--" if top_px_now is None else f"{top_px_now:.0f}"
-            cv2.rectangle(display_frame, (6, 40), (250, 92), (0, 0, 0), -1)
+            roll_text = "--" if top_roll_deg is None else f"{top_roll_deg:+.0f}"
+            cv2.rectangle(display_frame, (6, 40), (250, 107), (0, 0, 0), -1)
             cv2.putText(display_frame, norms_text, (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             cv2.putText(display_frame, scale_text, (10, 71), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
             cv2.putText(
@@ -818,6 +855,15 @@ class HandTrackerService:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.42,
                 (200, 220, 255),
+                1,
+            )
+            cv2.putText(
+                display_frame,
+                f"roll {roll_text} deg",
+                (10, 101),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 165, 255),
                 1,
             )
 
@@ -922,8 +968,9 @@ class HandTrackerService:
             side_shape = self._latest_frames["side"].shape
         reference = self._top_xy_mapper.reference
         if isinstance(top_state, dict):
+            roll_state = top_state.get("roll_deg")
             self._logger.info(
-                "Top XY: frame=%dx%d max_delta_px=%.0f ref=%s mid=(%.0f,%.0f) dx_px=%.1f dy_px=%.1f dx_norm=%+.2f dy_norm=%+.2f measure=%s px_per_m=%s valid=%s metric_fallback=%s",
+                "Top XY: frame=%dx%d max_delta_px=%.0f ref=%s mid=(%.0f,%.0f) dx_px=%.1f dy_px=%.1f dx_norm=%+.2f dy_norm=%+.2f measure=%s px_per_m=%s valid=%s metric_fallback=%s roll=%s",
                 top_shape[1],
                 top_shape[0],
                 self._top_xy_mapper.max_delta_px,
@@ -938,6 +985,7 @@ class HandTrackerService:
                 "None" if top_state.get("px_per_m") is None else f"{float(top_state.get('px_per_m')):.0f}",
                 top_state.get("scale_valid"),
                 top_state.get("metric_fallback"),
+                "--" if roll_state is None else f"{float(roll_state):+.2f}",
             )
         else:
             self._logger.info("Top XY: frame=%dx%d hand NOT detected", top_shape[1], top_shape[0])
@@ -986,6 +1034,8 @@ class HandTrackerService:
         pitch_3d_deg = float(side_state.get("pitch_3d_deg", 0.0)) if side_detected and side_state.get("pitch_3d_deg") is not None else 0.0
         pitch_2d_valid = 1.0 if side_detected and side_state.get("pitch_2d_deg") is not None else 0.0
         pitch_3d_valid = 1.0 if side_detected and side_state.get("pitch_3d_deg") is not None else 0.0
+        roll_deg = float(top_state.get("roll_deg", 0.0)) if detected and top_state.get("roll_deg") is not None else 0.0
+        roll_valid = 1.0 if detected and top_state.get("roll_deg") is not None else 0.0
         z_scale = self.get_z_scale()
 
         rr.log("hand_tracker/dz_norm", rr.Scalars(dz_norm))
@@ -1009,6 +1059,8 @@ class HandTrackerService:
         rr.log("hand_tracker/pitch_3d_deg", rr.Scalars(pitch_3d_deg))
         rr.log("hand_tracker/pitch_2d_valid", rr.Scalars(pitch_2d_valid))
         rr.log("hand_tracker/pitch_3d_valid", rr.Scalars(pitch_3d_valid))
+        rr.log("hand_tracker/roll_deg", rr.Scalars(roll_deg))
+        rr.log("hand_tracker/roll_valid", rr.Scalars(roll_valid))
         rr.log("hand_tracker/dx_norm", rr.Scalars(dx_norm))
         rr.log("hand_tracker/dy_norm", rr.Scalars(dy_norm))
         rr.log("hand_tracker/xy_scale", rr.Scalars(scale))
@@ -1021,6 +1073,7 @@ class HandTrackerService:
                 f"side hand {'detected' if side_detected else 'NOT detected'}: dz_norm = {dz_norm:+.3f}\n\n"
                 f"pitch2d = {pitch_2d_deg:+.2f} deg ({'ok' if pitch_2d_valid > 0 else 'n/a'})\n\n"
                 f"pitch3d = {pitch_3d_deg:+.2f} deg ({'ok' if pitch_3d_valid > 0 else 'n/a'})\n\n"
+                f"roll = {roll_deg:+.2f} deg ({'ok' if roll_valid > 0 else 'n/a'})\n\n"
                 f"z_scale = {z_scale:.3f} m"
             ),
         )
@@ -1167,13 +1220,13 @@ def calibrate_closed() -> None:
 def toggle_measure_source() -> str:
     if _default_service is not None:
         return _default_service.toggle_measure_source()
-    return MEASURE_SOURCE_PIXEL
+    return MEASURE_SOURCE_METRIC
 
 
 def get_measure_source() -> str:
     if _default_service is not None:
         return _default_service.get_measure_source()
-    return MEASURE_SOURCE_PIXEL
+    return MEASURE_SOURCE_METRIC
 
 
 def calibrate_top_xy(midpoint: tuple[float, float] | None) -> None:

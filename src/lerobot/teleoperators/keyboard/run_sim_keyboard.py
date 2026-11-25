@@ -525,6 +525,8 @@ def _send_default_rerun_blueprint() -> None:
             rrb.TimeSeriesView(origin="hand_tracker/px_per_m_top"),
             rrb.TimeSeriesView(origin="hand_tracker/pitch_2d_deg"),
             rrb.TimeSeriesView(origin="hand_tracker/pitch_3d_deg"),
+            rrb.TimeSeriesView(origin="hand_tracker/roll_deg"),
+            rrb.TimeSeriesView(origin="hand_tracker/roll_valid"),
             rrb.TimeSeriesView(origin="hand_tracker/gripper_fraction"),
             rrb.TimeSeriesView(origin="teleop/target_ee"),
             rrb.TimeSeriesView(origin="teleop/observed_ee"),

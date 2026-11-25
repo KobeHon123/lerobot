@@ -13,9 +13,11 @@ In both modes, `1` = keyboard mode, `2` = lightweight handtracker logging,
 motion scale while in handtracker mode.
 
 In handtracker modes (`2` / `3`), `4` toggles the XY mapping, `5` toggles the Z
-mapping, and `6` cycles pitch mapping: 2D elevation -> 3D elevation -> off.
-A disabled axis group keeps its last position. Re-enabling re-bases the hand
-reference to the current hand pose, so the arm does not jump.
+mapping, `6` cycles pitch mapping starting disabled (off -> 2D elevation -> 3D
+elevation -> off), `7` toggles roll mapping, and `8` toggles the measurement source
+between the default metric path and the raw pixel path. A disabled axis group keeps
+its last position. Re-enabling re-bases the hand reference to the current hand pose,
+so the arm does not jump.
 """
 
 from __future__ import annotations
@@ -80,6 +82,19 @@ PITCH_DT_MAX_S = 0.1
 # If the pitch measurement has been unavailable for longer than this, re-anchor the
 # reference to the hand's current elevation when it comes back.
 PITCH_REBASE_TIMEOUT_S = 1.0
+# Roll mapping (top cam, thumb-root 1 -> index-root 5). Mirrors the pitch creep:
+# deadzone, EMA smoothing, per-tick rate limit, and a reference angle captured when
+# roll is enabled (or re-anchored after the hand is lost) so enabling never jumps.
+ROLL_DEADZONE_DEG = 2.0
+ROLL_CLAMP_DEG = 40.0
+ROLL_EMA_TAU_S = 0.15
+ROLL_RATE_LIMIT_DEG_PER_S = 120.0
+ROLL_GAIN_DEFAULT = 1.0
+# Flip to +1.0 if the arm rolls opposite to the hand.
+ROLL_SIGN = -1.0
+ROLL_DT_MIN_S = 1e-3
+ROLL_DT_MAX_S = 0.1
+ROLL_REBASE_TIMEOUT_S = 1.0
 
 
 @TeleoperatorConfig.register_subclass("keyboard_so_leader")
@@ -155,6 +170,20 @@ class KeyboardSOLeader(Teleoperator):
         self._pitch_R_base: np.ndarray | None = None
         self._pitch_axis_n: np.ndarray | None = None
         self._pitch_down_seed_deg: float = PITCH_DOWN_DEFAULT_DEG
+        # Roll mapping (top cam, thumb-root 1 -> index-root 5), disabled by default.
+        # Applied as a rotation about the tool axis on top of the pitch frame.
+        self._roll_mapping_enabled: bool = False
+        self._roll_rebase_pending: bool = False
+        self._roll_gain: float = ROLL_GAIN_DEFAULT
+        self._roll_cmd_deg: float = 0.0
+        self._roll_baseline_deg: float = 0.0
+        self._roll_angle_ref_deg: float | None = None
+        self._last_roll_delta_ema_deg: float = 0.0
+        self._last_roll_valid_t: float = 0.0
+        self._last_roll_measurement_deg: float = 0.0
+        self._roll_hold_timeout_s: float = self._xy_hold_timeout_s
+        self._last_roll_cmd_update_t: float = time.monotonic()
+        self._roll_gap_s: float = 0.0
 
         # Optional handtracker integration
         self._handtracker = None
@@ -226,9 +255,12 @@ class KeyboardSOLeader(Teleoperator):
             }
             self._xy_rebase_pending = True
             self._z_rebase_pending = True
-            self._pitch_mapping_mode = PITCH_MODE_2D
-            self._pitch_rebase_pending = True
+            # Pitch and roll start DISABLED in handtracker modes; key 6 enables pitch
+            # and key 7 enables roll. Re-base the roll reference if it was left on.
+            self._pitch_mapping_mode = PITCH_MODE_OFF
+            self._pitch_rebase_pending = False
             self._pitch_down_baseline_deg = float(self._pitch_down_cmd_deg)
+            self._roll_rebase_pending = self._roll_mapping_enabled
         self._control_mode = mode
         logger.info("Control mode switched to: %s", self._control_mode)
 
@@ -321,6 +353,12 @@ class KeyboardSOLeader(Teleoperator):
             "ee.z": float(self._state["ee.z"]),
         }
         self._init_pitch_frame()
+        # Roll frame: start centred on the seed pose.
+        self._roll_cmd_deg = 0.0
+        self._roll_baseline_deg = 0.0
+        self._roll_angle_ref_deg = None
+        self._last_roll_delta_ema_deg = 0.0
+        self._roll_rebase_pending = self._roll_mapping_enabled
         self._apply_orientation_lock()
         logger.info("Seeded initial EE pose: %s", {k: self._state[k] for k in self.motors})
 
@@ -531,6 +569,50 @@ class KeyboardSOLeader(Teleoperator):
         else:
             self._set_pitch_mapping_mode(PITCH_MODE_2D)
 
+    def _toggle_roll_mapping(self) -> None:
+        if self._control_mode != CONTROL_MODE_HANDTRACKER:
+            logger.info("Roll mapping toggle ignored: only available in handtracker modes (2 / 3)")
+            return
+        self._roll_mapping_enabled = not self._roll_mapping_enabled
+        if self._roll_mapping_enabled:
+            self._roll_rebase_pending = True
+            logger.info("Roll mapping ENABLED (waiting for hand to re-base reference)")
+        else:
+            self._roll_rebase_pending = False
+            logger.info("Roll mapping DISABLED (holding last roll %.1f deg)", self._roll_cmd_deg)
+
+    def _read_roll_deg(self) -> float | None:
+        if self._handtracker is None or not hasattr(self._handtracker, "get_latest_xy"):
+            return None
+        if not self._roll_mapping_enabled:
+            return None
+        try:
+            top = self._handtracker.get_latest_xy().get("top")
+            now = time.monotonic()
+            if top is None or top.get("roll_deg") is None:
+                if now - self._last_roll_valid_t <= self._roll_hold_timeout_s:
+                    return self._last_roll_measurement_deg
+                return None
+            value = float(top.get("roll_deg", 0.0))
+            # Gap since the previous *fresh* reading (not the held value).
+            self._roll_gap_s = now - self._last_roll_valid_t if self._last_roll_valid_t > 0.0 else 0.0
+            self._last_roll_measurement_deg = value
+            self._last_roll_valid_t = now
+            return value
+        except Exception:
+            logger.exception("Failed to read handtracker roll angle")
+            return None
+
+    def _try_rebase_roll(self) -> bool:
+        roll = self._read_roll_deg()
+        if roll is None:
+            return False
+        self._roll_angle_ref_deg = float(roll)
+        self._roll_baseline_deg = float(self._roll_cmd_deg)
+        self._last_roll_delta_ema_deg = 0.0
+        self._roll_rebase_pending = False
+        return True
+
     def _toggle_measure_source(self) -> None:
         if self._control_mode != CONTROL_MODE_HANDTRACKER:
             logger.info("Measurement source toggle ignored: only available in handtracker modes (2 / 3)")
@@ -588,8 +670,8 @@ class KeyboardSOLeader(Teleoperator):
             try:
                 return str(self._handtracker.get_measure_source())
             except Exception:
-                return "pixel"
-        return "pixel"
+                return "metric"
+        return "metric"
 
     def _control_status_text(self) -> str:
         mode_label = {
@@ -602,6 +684,7 @@ class KeyboardSOLeader(Teleoperator):
             f"XY mapping: {'ENABLED' if self._xy_mapping_enabled else 'DISABLED'}\n\n"
             f"Z mapping: {'ENABLED' if self._z_mapping_enabled else 'DISABLED'}\n\n"
             f"pitch: {self._pitch_mapping_mode}\n\n"
+            f"roll: {'ENABLED' if self._roll_mapping_enabled else 'DISABLED'} ({self._roll_cmd_deg:+.1f} deg)\n\n"
             f"measure: {self._current_measure_source()}\n\n"
             f"xy_scale: {self._xy_scale:.3f} m\n\n"
             f"z_scale: {self._z_scale:.3f} m"
@@ -612,15 +695,19 @@ class KeyboardSOLeader(Teleoperator):
             self._handtracker.set_control_status(self._control_status_text())
 
     def _update_handtracker_orientation(self) -> None:
-        """Rotate the seeded orientation about a fixed horizontal axis by the pitch delta.
+        """Rotate the seeded orientation by the pitch and roll commands.
 
-        At ``pitch_cmd == pitch_down_seed`` this reproduces the seed orientation exactly,
-        so entering modes 2/3 (or moving the hand sideways) no longer jumps the target.
+        Pitch rotates about a fixed horizontal axis so ``pitch_cmd == pitch_down_seed``
+        reproduces the seed orientation exactly. Roll is a rotation about the tool
+        (approach) axis applied on top, so it does not disturb the pitch mapping.
+        Entering modes 2/3 (or moving the hand sideways) no longer jumps the target.
         """
         if self._pitch_R_base is None or self._pitch_axis_n is None:
             return
         delta_rad = math.radians(self._pitch_down_cmd_deg - self._pitch_down_seed_deg)
         r_target = self._rot_axis_angle(self._pitch_axis_n, delta_rad) @ self._pitch_R_base
+        if self._roll_cmd_deg != 0.0:
+            r_target = r_target @ self._rot_axis_angle(np.array([0.0, 0.0, 1.0]), math.radians(self._roll_cmd_deg))
         rotvec = Rotation.from_matrix(np.asarray(r_target, dtype=float)).as_rotvec()
         self._orientation_lock = {
             "ee.wx": float(rotvec[0]),
@@ -641,6 +728,12 @@ class KeyboardSOLeader(Teleoperator):
         self._last_pitch_delta_ema_deg = 0.0
         self._pitch_elevation_ref_deg = None
         self._pitch_rebase_pending = self._pitch_mapping_mode != PITCH_MODE_OFF
+        # Roll: clear the command and re-anchor to the current hand pose on the next tick.
+        self._roll_cmd_deg = 0.0
+        self._roll_baseline_deg = 0.0
+        self._roll_angle_ref_deg = None
+        self._last_roll_delta_ema_deg = 0.0
+        self._roll_rebase_pending = self._roll_mapping_enabled
         # The hand's current pose becomes the new neutral; rebase on the next handtracker tick.
         self._xy_rebase_pending = True
         self._z_rebase_pending = True
@@ -736,21 +829,73 @@ class KeyboardSOLeader(Teleoperator):
                         self._pitch_down_cmd_deg = float(pitch_target)
                         pitch_live = True
 
+        # Roll tick clock: refreshed every tick and clamped, like pitch.
+        roll_now = time.monotonic()
+        roll_dt = max(ROLL_DT_MIN_S, min(ROLL_DT_MAX_S, roll_now - self._last_roll_cmd_update_t))
+        self._last_roll_cmd_update_t = roll_now
+
+        roll_live = False
+        if self._roll_mapping_enabled:
+            if self._roll_rebase_pending:
+                if self._try_rebase_roll():
+                    logger.info(
+                        "Roll reference re-based at %.2f deg (roll=%.1f deg)",
+                        float(self._roll_angle_ref_deg or 0.0),
+                        self._roll_cmd_deg,
+                    )
+            else:
+                roll = self._read_roll_deg()
+                if roll is not None:
+                    if self._roll_angle_ref_deg is None or self._roll_gap_s > ROLL_REBASE_TIMEOUT_S:
+                        # Hand was gone long enough: re-anchor to the current roll.
+                        self._roll_angle_ref_deg = float(roll)
+                        self._roll_baseline_deg = float(self._roll_cmd_deg)
+                        self._last_roll_delta_ema_deg = 0.0
+                        logger.info(
+                            "Roll reference auto-re-based after %.2fs gap at %.2f deg",
+                            self._roll_gap_s,
+                            float(roll),
+                        )
+                    else:
+                        hand_delta = float(roll - self._roll_angle_ref_deg)
+                        hand_delta = self._apply_deadzone(hand_delta, ROLL_DEADZONE_DEG)
+                        hand_delta = max(-ROLL_CLAMP_DEG, min(ROLL_CLAMP_DEG, hand_delta))
+                        alpha = 1.0 - math.exp(-roll_dt / ROLL_EMA_TAU_S)
+                        self._last_roll_delta_ema_deg = (
+                            alpha * hand_delta + (1.0 - alpha) * self._last_roll_delta_ema_deg
+                        )
+                        roll_target = (
+                            self._roll_baseline_deg
+                            + ROLL_SIGN * self._roll_gain * self._last_roll_delta_ema_deg
+                        )
+                        roll_target = max(-ROLL_CLAMP_DEG, min(ROLL_CLAMP_DEG, roll_target))
+
+                        max_step = ROLL_RATE_LIMIT_DEG_PER_S * roll_dt
+                        delta_cmd = roll_target - self._roll_cmd_deg
+                        if abs(delta_cmd) > max_step:
+                            roll_target = self._roll_cmd_deg + math.copysign(max_step, delta_cmd)
+                        self._roll_cmd_deg = float(roll_target)
+                        roll_live = True
+
         self._update_handtracker_orientation()
 
         now = time.monotonic()
         if now - self._last_hand_log_t >= self._hand_log_interval_s:
             self._last_hand_log_t = now
             logger.info(
-                "Hand mapped -> ee.x=%.3f ee.y=%.3f ee.z=%.3f pitch_down=%.1f deg (xy %s, z %s, pitch %s:%s)",
+                "Hand mapped -> ee.x=%.3f ee.y=%.3f ee.z=%.3f pitch_down=%.1f deg roll=%.1f deg "
+                "(xy %s, z %s, pitch %s:%s, roll %s:%s)",
                 self._state["ee.x"],
                 self._state["ee.y"],
                 self._state["ee.z"],
                 self._pitch_down_cmd_deg,
+                self._roll_cmd_deg,
                 self._mapping_status(xy is not None, self._xy_mapping_enabled, self._xy_rebase_pending),
                 self._mapping_status(dz_norm is not None, self._z_mapping_enabled, self._z_rebase_pending),
                 self._pitch_mapping_mode,
                 "live" if pitch_live else ("waiting" if self._pitch_rebase_pending else "held"),
+                "on" if self._roll_mapping_enabled else "off",
+                "live" if roll_live else ("waiting" if self._roll_rebase_pending else "held"),
             )
 
     def get_action(self) -> dict[str, float]:
@@ -805,6 +950,9 @@ class KeyboardSOLeader(Teleoperator):
                         self._toggle_pitch_mapping_mode()
                         return
                     if lowered == "7":
+                        self._toggle_roll_mapping()
+                        return
+                    if lowered == "8":
                         self._toggle_measure_source()
                         return
 
